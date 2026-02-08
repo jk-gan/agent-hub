@@ -1,4 +1,6 @@
+mod app_assets;
 mod codex;
+mod theme;
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -11,7 +13,7 @@ use codex::app_server::{AppServer, AppServerError, RequestMethod, ServerNotifica
 use gpui::prelude::*;
 use gpui::{
     App, Application, Bounds, Context, Entity, KeyBinding, Menu, MenuItem, Render, ScrollHandle,
-    Subscription, Window, WindowBounds, WindowOptions, actions, div, px, rgb, size,
+    Subscription, Window, WindowBounds, WindowOptions, actions, div, px, size,
 };
 use gpui_component::Root;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -20,11 +22,12 @@ use gpui_component::sidebar::{
     SidebarToggleButton,
 };
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
-use gpui_component::theme::{Theme, hsl};
+use gpui_component::theme::{Theme as ComponentTheme, hsl};
 use gpui_component::{Icon, IconName};
 use gpui_component_assets::Assets;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use theme::Theme as AppTheme;
 
 actions!(
     agent_hub,
@@ -1437,9 +1440,26 @@ impl Render for AppShell {
             items
         };
 
+        let app_theme = cx.global::<AppTheme>();
+        let sidebar_bg = app_theme.mantle;
+        let divider_color = app_theme.surface0;
+        let content_bg = app_theme.base;
+        let text_color = app_theme.text;
+        let subtext_color = app_theme.subtext0;
+        let overlay_color = app_theme.overlay1;
+        let surface0 = app_theme.surface0;
+        let surface1 = app_theme.surface1;
+        let mantle = app_theme.mantle;
+        let red_color = app_theme.red;
+        let blue_color = app_theme.blue;
+        let crust = app_theme.crust;
+        let font_sans: gpui::SharedString = app_theme.font_sans.clone();
+        let font_mono: gpui::SharedString = app_theme.font_mono.clone();
+
         div()
             .size_full()
-            .bg(rgb(0xe5e5e5))
+            .font_family(font_sans)
+            .bg(sidebar_bg)
             .flex()
             .flex_row()
             .child(
@@ -1513,12 +1533,12 @@ impl Render for AppShell {
                         ),
                     ),
             )
-            .child(div().w(px(1.)).h_full().bg(rgb(0xb2b2b2)))
+            .child(div().w(px(1.)).h_full().bg(divider_color))
             .child(
                 div()
                     .flex_1()
                     .h_full()
-                    .bg(rgb(0xf0f0f0))
+                    .bg(content_bg)
                     .flex()
                     .flex_col()
                     .child(
@@ -1529,14 +1549,14 @@ impl Render for AppShell {
                             .flex()
                             .items_center()
                             .text_sm()
-                            .text_color(rgb(0x262626))
+                            .text_color(text_color)
                             .child(
                                 self.selected_thread_title
                                     .clone()
                                     .unwrap_or_else(|| "Thread".to_string()),
                             ),
                     )
-                    .child(div().w_full().h(px(1.)).bg(rgb(0xd4d4d4)))
+                    .child(div().w_full().h(px(1.)).bg(divider_color))
                     .child(
                         div()
                             .id("chat-scroll")
@@ -1566,16 +1586,16 @@ impl Render for AppShell {
                                                         .child(
                                                             div()
                                                                 .max_w(px(700.))
-                                                                .bg(rgb(0xe2e2e2))
+                                                                .bg(surface0)
                                                                 .rounded(px(14.))
                                                                 .px(px(14.))
                                                                 .py(px(10.))
-                                                                .text_color(rgb(0x111827))
+                                                                .text_color(text_color)
                                                                 .child(
                                                                     TextView::new(
                                                                         &message.view_state,
                                                                     )
-                                                                    .text_color(rgb(0x111827))
+                                                                    .text_color(text_color)
                                                                     .selectable(true),
                                                                 ),
                                                         )
@@ -1590,7 +1610,7 @@ impl Render for AppShell {
                                                                 .child(
                                                                     div()
                                                                         .max_w(px(860.))
-                                                                        .text_color(rgb(0x111827))
+                                                                        .text_color(text_color)
                                                                         .child(
                                                                             TextView::new(
                                                                                 &message.view_state,
@@ -1599,20 +1619,20 @@ impl Render for AppShell {
                                                                                 TextViewStyle::default()
                                                                                     .code_block(
                                                                                         gpui::StyleRefinement::default()
-                                                                                            .bg(rgb(0xf5f5f5))
+                                                                                            .bg(mantle)
                                                                                             .text_color(
-                                                                                                rgb(0x111827),
+                                                                                                text_color,
                                                                                             )
                                                                                             .border_1()
                                                                                             .border_color(
-                                                                                                rgb(0xd4d4d8),
+                                                                                                surface1,
                                                                                             )
                                                                                             .rounded(px(6.))
                                                                                             .px(px(12.))
                                                                                             .py(px(10.)),
                                                                                     ),
                                                                             )
-                                                                            .text_color(rgb(0x111827))
+                                                                            .text_color(text_color)
                                                                             .selectable(true),
                                                                         ),
                                                                 )
@@ -1658,16 +1678,16 @@ impl Render for AppShell {
                                                                                                 TextViewStyle::default()
                                                                                                     .code_block(
                                                                                                         gpui::StyleRefinement::default()
-                                                                                                            .bg(rgb(0xd1d5db))
+                                                                                                            .bg(surface0)
                                                                                                             .text_color(
-                                                                                                                rgb(0x111827),
+                                                                                                                text_color,
                                                                                                             )
                                                                                                             .rounded(px(6.))
                                                                                                             .px(px(12.))
                                                                                                             .py(px(10.)),
                                                                                                     ),
                                                                                             )
-                                                                                            .text_color(rgb(0x111827))
+                                                                                            .text_color(text_color)
                                                                                             .selectable(true),
                                                                                         )
                                                                                 })
@@ -1704,19 +1724,19 @@ impl Render for AppShell {
                                     } else if let Some(error) = &self.selected_thread_error {
                                         div()
                                             .text_sm()
-                                            .text_color(rgb(0x7f1d1d))
+                                            .text_color(red_color)
                                             .child(format!("Unable to render thread: {error}"))
                                             .into_any_element()
                                     } else if self.loading_threads || self.loading_selected_thread {
                                         div()
                                             .text_sm()
-                                            .text_color(rgb(0x4b5563))
+                                            .text_color(subtext_color)
                                             .child("Loading thread content...")
                                             .into_any_element()
                                     } else {
                                         div()
                                             .text_sm()
-                                            .text_color(rgb(0x4b5563))
+                                            .text_color(subtext_color)
                                             .child("Select a thread to view its content.")
                                             .into_any_element()
                                     }),
@@ -1734,10 +1754,10 @@ impl Render for AppShell {
                             .child(
                                 div()
                                     .w_full()
-                                    .max_w(px(980.))
-                                    .bg(rgb(0xf5f5f5))
+                                    .max_w(px(930.))
+                                    .bg(mantle)
                                     .border_1()
-                                    .border_color(rgb(0xd9d9d9))
+                                    .border_color(surface1)
                                     .rounded(px(22.))
                                     .shadow(vec![gpui::BoxShadow {
                                         color: gpui::Hsla {
@@ -1750,20 +1770,18 @@ impl Render for AppShell {
                                         spread_radius: px(0.),
                                         offset: gpui::point(px(0.), px(2.)),
                                     }])
-                                    .px(px(16.))
-                                    .pt(px(10.))
-                                    .pb(px(10.))
+                                    .p(px(10.))
                                     .flex()
                                     .flex_col()
                                     .gap(px(10.))
                                     .child(
-                                        div().w_full().min_h(px(76.)).child(
+                                        div().w_full().min_h(px(43.)).child(
                                             Input::new(&self.input_state)
                                                 .appearance(false)
                                                 .bordered(false)
                                                 .focus_bordered(false)
                                                 .h_full()
-                                                .text_color(rgb(0x2f2f2f))
+                                                .text_color(text_color)
                                                 .disabled(
                                                     self.sending_message
                                                         || self._app_server.is_none(),
@@ -1784,7 +1802,7 @@ impl Render for AppShell {
                                                     .child(
                                                         Icon::new(IconName::Plus)
                                                             .size(px(24.))
-                                                            .text_color(rgb(0x7f7f7f)),
+                                                            .text_color(overlay_color),
                                                     )
                                                     .child(
                                                         div()
@@ -1792,12 +1810,12 @@ impl Render for AppShell {
                                                             .items_center()
                                                             .gap(px(8.))
                                                             .text_sm()
-                                                            .text_color(rgb(0x777777))
+                                                            .text_color(overlay_color)
                                                             .child("GPT-5.3-Codex")
                                                             .child(
                                                                 Icon::new(IconName::ChevronDown)
                                                                     .size(px(16.))
-                                                                    .text_color(rgb(0x777777)),
+                                                                    .text_color(overlay_color),
                                                             ),
                                                     )
                                                     .child(
@@ -1806,12 +1824,12 @@ impl Render for AppShell {
                                                             .items_center()
                                                             .gap(px(8.))
                                                             .text_sm()
-                                                            .text_color(rgb(0x777777))
+                                                            .text_color(overlay_color)
                                                             .child("High")
                                                             .child(
                                                                 Icon::new(IconName::ChevronDown)
                                                                     .size(px(16.))
-                                                                    .text_color(rgb(0x777777)),
+                                                                    .text_color(overlay_color),
                                                             ),
                                                     ),
                                             )
@@ -1823,20 +1841,20 @@ impl Render for AppShell {
                                                     .child(
                                                         div()
                                                             .text_sm()
-                                                            .text_color(rgb(0x888888))
+                                                            .text_color(overlay_color)
                                                             .child("0."),
                                                     )
                                                     .child(
                                                         div()
-                                                            .size(px(44.))
+                                                            .size(px(34.))
                                                             .rounded(px(999.))
                                                             .flex()
                                                             .items_center()
                                                             .justify_center()
                                                             .bg(if can_send {
-                                                                rgb(0x858585)
+                                                                blue_color
                                                             } else {
-                                                                rgb(0xc6c6c6)
+                                                                surface1
                                                             })
                                                             .when(can_send, |this| {
                                                                 this.cursor_pointer()
@@ -1854,7 +1872,7 @@ impl Render for AppShell {
                                                             .child(
                                                                 Icon::new(IconName::ArrowUp)
                                                                     .size(px(20.))
-                                                                    .text_color(rgb(0xffffff)),
+                                                                    .text_color(crust),
                                                             ),
                                                     ),
                                             ),
@@ -1868,12 +1886,17 @@ impl Render for AppShell {
 fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         gpui_component::init(cx);
-        let theme = Theme::global_mut(cx);
-        theme.foreground = hsl(220., 12., 16.);
+        AppTheme::init(cx);
+        let app_theme = cx.global::<AppTheme>();
+        let text_color = app_theme.text;
+        let blue_color = app_theme.blue;
+        let theme = ComponentTheme::global_mut(cx);
+        theme.foreground = text_color;
+        theme.caret = text_color;
         theme.accent = hsl(210., 26., 88.);
         theme.accent_foreground = hsl(220., 18., 20.);
-        theme.link = hsl(217., 70., 45.);
-        theme.link_hover = hsl(217., 70., 38.);
+        theme.link = blue_color;
+        theme.link_hover = blue_color;
 
         let bounds = Bounds::centered(None, size(px(1_520.), px(920.)), cx);
 
