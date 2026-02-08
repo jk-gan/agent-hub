@@ -1,5 +1,6 @@
 mod app_assets;
 mod codex;
+mod sidebar;
 mod theme;
 
 use std::cmp::Reverse;
@@ -17,17 +18,18 @@ use gpui::{
     Subscription, Window, WindowBounds, WindowOptions, actions, div, px, size,
 };
 use gpui_component::Root;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::sidebar::{
-    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
-    SidebarToggleButton,
-};
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::theme::{Theme as ComponentTheme, hsl};
-use gpui_component::{Icon, IconName};
+use gpui_component::{Icon, IconName, Sizable as _};
 use gpui_component_assets::Assets;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sidebar::{
+    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
+    SidebarToggleButton,
+};
 use theme::Theme as AppTheme;
 
 actions!(
@@ -165,6 +167,7 @@ struct AppShell {
     thread_content_cache_path: PathBuf,
     thread_resume_content_cache_path: PathBuf,
     threads: Vec<ThreadRow>,
+    expanded_workspace_groups: HashSet<String>,
     expanded_workspace_threads: HashSet<String>,
     selected_thread_id: Option<String>,
     selected_thread_title: Option<String>,
@@ -190,6 +193,8 @@ impl AppShell {
         let raw_cache_path = Self::raw_thread_cache_path(&cwd);
         let thread_content_cache_path = Self::thread_content_cache_path(&cwd);
         let thread_resume_content_cache_path = Self::thread_resume_content_cache_path(&cwd);
+        let mut expanded_workspace_groups = HashSet::new();
+        expanded_workspace_groups.insert(cwd.clone());
         let (threads, thread_error) = match Self::read_threads_cache(&cache_path) {
             Ok(rows) => (rows, None),
             Err(error) => (Vec::new(), Some(format!("cache read failed: {error}"))),
@@ -230,6 +235,7 @@ impl AppShell {
             thread_content_cache_path,
             thread_resume_content_cache_path,
             threads,
+            expanded_workspace_groups,
             expanded_workspace_threads: HashSet::new(),
             selected_thread_id: None,
             selected_thread_title: None,
@@ -292,6 +298,17 @@ impl AppShell {
             .and_then(|segment| segment.to_str())
             .map(str::to_owned)
             .unwrap_or_else(|| cwd.to_string())
+    }
+
+    fn workspace_action_id(prefix: &str, workspace_cwd: &str) -> String {
+        let suffix = workspace_cwd
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+            .collect::<String>();
+        if suffix.is_empty() {
+            return format!("{prefix}-workspace");
+        }
+        format!("{prefix}-{suffix}")
     }
 
     fn relative_time(unix_ts: u64) -> String {
@@ -577,10 +594,6 @@ impl AppShell {
             if was_truncated {
                 break;
             }
-        }
-
-        if messages.is_empty() {
-            return Err("no user or assistant messages found in session log".to_string());
         }
 
         if was_truncated {
@@ -941,12 +954,6 @@ impl AppShell {
             }
         }
 
-        if messages.is_empty() {
-            return Err(
-                "thread response returned no user, assistant, or tool messages".to_string(),
-            );
-        }
-
         if was_truncated {
             messages.push(RenderableMessage::Text {
                 speaker: ThreadSpeaker::Assistant,
@@ -1091,8 +1098,69 @@ impl AppShell {
         self.refresh_selected_thread(cx);
     }
 
+    fn start_new_thread_in_workspace(&mut self, workspace_cwd: String, cx: &mut Context<Self>) {
+        let Some(server) = self._app_server.clone() else {
+            self.selected_thread_error = Some("Not connected to app-server".to_string());
+            cx.notify();
+            return;
+        };
+
+        self.expanded_workspace_groups.insert(workspace_cwd.clone());
+        self.selected_thread_error = None;
+        self.selected_thread_id = None;
+        self.selected_thread_messages.clear();
+        self.selected_thread_title = Some("New thread".to_string());
+        self.selected_thread_loaded_from_api_id = None;
+        self.loading_selected_thread = false;
+        self.streaming_message_ix = None;
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let response = server
+                .call(
+                    RequestMethod::ThreadStart,
+                    json!({ "cwd": workspace_cwd.clone() }),
+                )
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                match response {
+                    Ok(payload) => {
+                        let id = payload
+                            .get("thread")
+                            .and_then(|thread| thread.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if id.is_empty() {
+                            view.selected_thread_error =
+                                Some("thread/start returned no thread id".to_string());
+                            cx.notify();
+                            return;
+                        }
+                        view.selected_thread_id = Some(id);
+                        view.selected_thread_title = Some("New thread".to_string());
+                        view.selected_thread_messages.clear();
+                        view.selected_thread_error = None;
+                        view.selected_thread_loaded_from_api_id = None;
+                        view.loading_selected_thread = false;
+                        view.sending_message = false;
+                        view.streaming_message_ix = None;
+                        view.load_threads_from_server(Arc::clone(&server), cx);
+                    }
+                    Err(error) => {
+                        view.selected_thread_error = Some(format!("thread/start failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn clear_workspace_state(&mut self) {
         self.threads.clear();
+        self.expanded_workspace_groups.clear();
+        self.expanded_workspace_groups.insert(self.cwd.clone());
         self.expanded_workspace_threads.clear();
         self.selected_thread_id = None;
         self.selected_thread_title = None;
@@ -1575,6 +1643,7 @@ impl Render for AppShell {
         } else {
             let mut items = Vec::new();
             for group in &workspace_groups {
+                let is_workspace_open = self.expanded_workspace_groups.contains(&group.cwd);
                 let show_all = self.expanded_workspace_threads.contains(&group.cwd);
                 let visible_count = if show_all {
                     group.threads.len()
@@ -1583,33 +1652,29 @@ impl Render for AppShell {
                 };
                 let hidden_count = group.threads.len().saturating_sub(visible_count);
 
-                let mut children = group
-                    .threads
-                    .iter()
-                    .take(visible_count)
-                    .map(|row| {
-                        let is_active = selected_id.as_deref() == Some(row.id.as_str());
-                        let mut item = SidebarMenuItem::new(row.title.clone())
-                            .icon(IconName::Bot)
-                            .active(is_active)
-                            .on_click({
-                                let this = this.clone();
-                                let thread_id = row.id.clone();
-                                move |_, _, cx| {
-                                    let _ = this.update(cx, |view, cx| {
-                                        view.select_thread_by_id(&thread_id, cx);
-                                        cx.notify();
-                                    });
-                                }
-                            });
-                        if let Some(updated_at) = row.updated_at {
-                            item = item.suffix(move |_, _| {
-                                div().text_xs().child(Self::relative_time(updated_at))
-                            });
-                        }
-                        item
-                    })
-                    .collect::<Vec<_>>();
+                let mut children = Vec::new();
+                children.extend(group.threads.iter().take(visible_count).map(|row| {
+                    let is_active = selected_id.as_deref() == Some(row.id.as_str());
+                    let mut item = SidebarMenuItem::new(row.title.clone())
+                        .icon(IconName::Bot)
+                        .active(is_active)
+                        .on_click({
+                            let this = this.clone();
+                            let thread_id = row.id.clone();
+                            move |_, _, cx| {
+                                let _ = this.update(cx, |view, cx| {
+                                    view.select_thread_by_id(&thread_id, cx);
+                                    cx.notify();
+                                });
+                            }
+                        });
+                    if let Some(updated_at) = row.updated_at {
+                        item = item.suffix(move |_, _| {
+                            div().text_xs().child(Self::relative_time(updated_at))
+                        });
+                    }
+                    item
+                }));
 
                 if hidden_count > 0 {
                     children.push(
@@ -1646,16 +1711,58 @@ impl Render for AppShell {
 
                 items.push(
                     SidebarMenuItem::new(group.name.clone())
-                        .icon(if group.cwd == self.cwd {
+                        .icon(if is_workspace_open {
                             IconName::FolderOpen
                         } else {
-                            IconName::Folder
+                            IconName::FolderClosed
                         })
                         .active(group.cwd == self.cwd)
-                        .default_open(group.cwd == self.cwd)
+                        .default_open(is_workspace_open)
+                        .click_to_open(true)
+                        .show_caret(false)
+                        .on_open_change({
+                            let this = this.clone();
+                            let workspace_cwd = group.cwd.clone();
+                            move |is_open, _, cx| {
+                                let _ = this.update(cx, |view, cx| {
+                                    if is_open {
+                                        view.expanded_workspace_groups
+                                            .insert(workspace_cwd.clone());
+                                    } else {
+                                        view.expanded_workspace_groups.remove(&workspace_cwd);
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .suffix_visible_on_hover(true)
                         .suffix({
-                            let count = group.threads.len().to_string();
-                            move |_, _| div().text_xs().child(count.clone())
+                            let this = this.clone();
+                            let workspace_cwd = group.cwd.clone();
+                            let button_id =
+                                Self::workspace_action_id("workspace-new-thread", &workspace_cwd);
+                            move |_, _| {
+                                div().child(
+                                    Button::new(button_id.clone())
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Plus)
+                                        .tooltip("Start new thread in workspace")
+                                        .on_click({
+                                            let this = this.clone();
+                                            let workspace_cwd = workspace_cwd.clone();
+                                            move |_, _: &mut Window, cx: &mut App| {
+                                                cx.stop_propagation();
+                                                let _ = this.update(cx, |view, cx| {
+                                                    view.start_new_thread_in_workspace(
+                                                        workspace_cwd.clone(),
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }),
+                                )
+                            }
                         })
                         .children(children),
                 );
@@ -1938,7 +2045,7 @@ impl Render for AppShell {
                         ),
                     )
                     .child(
-                        SidebarGroup::new("Threads")
+                        SidebarGroup::new("Workspaces")
                             .child(SidebarMenu::new().children(thread_workspace_items)),
                     )
                     .footer(
@@ -2152,6 +2259,12 @@ impl Render for AppShell {
                                             .text_sm()
                                             .text_color(subtext_color)
                                             .child("Loading thread content...")
+                                            .into_any_element()
+                                    } else if self.selected_thread_id.is_some() {
+                                        div()
+                                            .text_sm()
+                                            .text_color(subtext_color)
+                                            .child("No messages in this thread yet.")
                                             .into_any_element()
                                     } else {
                                         div()
