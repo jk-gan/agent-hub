@@ -6,6 +6,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -147,6 +148,14 @@ enum RenderableMessage {
 
 struct AppShell {
     started: bool,
+    loading_auth_state: bool,
+    is_authenticated: bool,
+    account_email: Option<String>,
+    account_plan_type: Option<String>,
+    auth_error: Option<String>,
+    login_in_progress: bool,
+    pending_login_id: Option<String>,
+    login_url: Option<String>,
     loading_threads: bool,
     sidebar_collapsed: bool,
     thread_error: Option<String>,
@@ -204,6 +213,14 @@ impl AppShell {
 
         let mut shell = Self {
             started: false,
+            loading_auth_state: false,
+            is_authenticated: false,
+            account_email: None,
+            account_plan_type: None,
+            auth_error: None,
+            login_in_progress: false,
+            pending_login_id: None,
+            login_url: None,
             loading_threads: false,
             sidebar_collapsed: false,
             thread_error,
@@ -1074,16 +1091,201 @@ impl AppShell {
         self.refresh_selected_thread(cx);
     }
 
+    fn clear_workspace_state(&mut self) {
+        self.threads.clear();
+        self.expanded_workspace_threads.clear();
+        self.selected_thread_id = None;
+        self.selected_thread_title = None;
+        self.selected_thread_messages.clear();
+        self.selected_thread_loaded_from_api_id = None;
+        self.loading_selected_thread = false;
+        self.selected_thread_error = None;
+        self.sending_message = false;
+        self.streaming_message_ix = None;
+        self.loading_threads = false;
+        self.thread_error = None;
+    }
+
+    fn apply_account_read_payload(&mut self, payload: &Value) {
+        let account = payload.get("account").and_then(Value::as_object);
+        let requires_openai_auth = payload
+            .get("requiresOpenaiAuth")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        self.account_email = account
+            .and_then(|value| value.get("email"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.account_plan_type = account
+            .and_then(|value| value.get("planType"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        self.is_authenticated = account.is_some() || !requires_openai_auth;
+        if !self.is_authenticated {
+            self.clear_workspace_state();
+        }
+    }
+
+    fn load_threads_from_server(&mut self, server: Arc<AppServer>, cx: &mut Context<Self>) {
+        if self.loading_threads {
+            return;
+        }
+
+        self.loading_threads = true;
+        let cwd = self.cwd.clone();
+        let cache_path = self.cache_path.clone();
+        let raw_cache_path = self.raw_cache_path.clone();
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let response = server
+                .call(RequestMethod::ThreadList, json!({ "limit": 50 }))
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.loading_threads = false;
+                match response {
+                    Ok(payload) => match Self::parse_thread_rows(payload.clone(), &cwd) {
+                        Ok(rows) => {
+                            view.thread_error = None;
+                            view.threads = rows;
+                            view.refresh_selected_thread(cx);
+                            view.maybe_fetch_selected_thread_from_api(cx);
+                            if let Err(error) =
+                                Self::write_threads_cache(&cache_path, &cwd, &view.threads)
+                            {
+                                view.thread_error = Some(format!("cache write failed: {error}"));
+                            }
+                            if let Err(error) =
+                                Self::write_raw_threads_cache(&raw_cache_path, &cwd, &payload)
+                            {
+                                view.thread_error =
+                                    Some(format!("raw cache write failed: {error}"));
+                            }
+                        }
+                        Err(error) => {
+                            view.thread_error = Some(error);
+                        }
+                    },
+                    Err(error) => {
+                        view.thread_error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_account_state(
+        &mut self,
+        server: Arc<AppServer>,
+        load_threads_if_authenticated: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.loading_auth_state = true;
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let response = server.call(RequestMethod::AccountRead, json!({})).await;
+            let _ = view.update(cx, |view, cx| {
+                view.loading_auth_state = false;
+                match response {
+                    Ok(payload) => {
+                        view.auth_error = None;
+                        view.apply_account_read_payload(&payload);
+                        if view.is_authenticated && load_threads_if_authenticated {
+                            view.load_threads_from_server(Arc::clone(&server), cx);
+                        }
+                    }
+                    Err(error) => {
+                        view.auth_error = Some(format!("account/read failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_login(&mut self, cx: &mut Context<Self>) {
+        if self.login_in_progress {
+            return;
+        }
+
+        let Some(server) = self._app_server.clone() else {
+            self.auth_error = Some("Not connected to app-server".to_string());
+            cx.notify();
+            return;
+        };
+
+        self.login_in_progress = true;
+        self.auth_error = None;
+        self.login_url = None;
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let response = server
+                .call(
+                    RequestMethod::AccountLoginStart,
+                    json!({ "type": "chatgpt" }),
+                )
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.login_in_progress = false;
+                match response {
+                    Ok(payload) => {
+                        let login_id = payload
+                            .get("loginId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        let auth_url = payload
+                            .get("authUrl")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+
+                        match (login_id, auth_url) {
+                            (Some(login_id), Some(auth_url)) => {
+                                view.pending_login_id = Some(login_id);
+                                view.login_url = Some(auth_url.clone());
+                                Self::open_auth_url(&auth_url);
+                            }
+                            _ => {
+                                view.auth_error = Some(
+                                    "account/login/start returned an invalid response".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        view.auth_error = Some(format!("account/login/start failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_auth_url(url: &str) {
+        #[cfg(target_os = "macos")]
+        let _ = Command::new("open").arg(url).spawn();
+
+        #[cfg(target_os = "linux")]
+        let _ = Command::new("xdg-open").arg(url).spawn();
+
+        #[cfg(target_os = "windows")]
+        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    }
+
     fn maybe_load_threads(&mut self, cx: &mut Context<Self>) {
         if self.started {
             return;
         }
 
         self.started = true;
-        self.loading_threads = true;
-        let cwd = self.cwd.clone();
-        let cache_path = self.cache_path.clone();
-        let raw_cache_path = self.raw_cache_path.clone();
+        self.loading_auth_state = true;
         if let Err(error) = Self::write_threads_cache(&self.cache_path, &self.cwd, &self.threads) {
             self.thread_error = Some(format!("cache write failed: {error}"));
         }
@@ -1094,49 +1296,16 @@ impl AppShell {
 
             match connection {
                 Ok(server) => {
-                    let response = server
-                        .call(RequestMethod::ThreadList, json!({ "limit": 50 }))
-                        .await;
                     let _ = view.update(cx, |view, cx| {
-                        view.loading_threads = false;
                         view._app_server = Some(Arc::clone(&server));
                         view.start_event_pump(Arc::clone(&server), cx);
-                        match response {
-                            Ok(payload) => match Self::parse_thread_rows(payload.clone(), &cwd) {
-                                Ok(rows) => {
-                                    view.thread_error = None;
-                                    view.threads = rows;
-                                    view.refresh_selected_thread(cx);
-                                    view.maybe_fetch_selected_thread_from_api(cx);
-                                    if let Err(error) =
-                                        Self::write_threads_cache(&cache_path, &cwd, &view.threads)
-                                    {
-                                        view.thread_error =
-                                            Some(format!("cache write failed: {error}"));
-                                    }
-                                    if let Err(error) = Self::write_raw_threads_cache(
-                                        &raw_cache_path,
-                                        &cwd,
-                                        &payload,
-                                    ) {
-                                        view.thread_error =
-                                            Some(format!("raw cache write failed: {error}"));
-                                    }
-                                }
-                                Err(error) => {
-                                    view.thread_error = Some(error);
-                                }
-                            },
-                            Err(error) => {
-                                view.thread_error = Some(error.to_string());
-                            }
-                        }
+                        view.refresh_account_state(Arc::clone(&server), true, cx);
                         cx.notify();
                     });
                 }
                 Err(error) => {
                     let _ = view.update(cx, |view, cx| {
-                        view.loading_threads = false;
+                        view.loading_auth_state = false;
                         view.thread_error = Some(error.to_string());
                         cx.notify();
                     });
@@ -1211,6 +1380,57 @@ impl AppShell {
             "turn/completed" => {
                 self.sending_message = false;
                 self.streaming_message_ix = None;
+            }
+            "account/login/completed" => {
+                let success = notification
+                    .params
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let login_id = notification
+                    .params
+                    .get("loginId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let (Some(expected_login_id), Some(received_login_id)) =
+                    (self.pending_login_id.as_deref(), login_id.as_deref())
+                {
+                    if expected_login_id != received_login_id {
+                        return;
+                    }
+                }
+
+                self.pending_login_id = None;
+                self.login_in_progress = false;
+
+                if success {
+                    self.auth_error = None;
+                    if let Some(server) = self._app_server.clone() {
+                        self.refresh_account_state(server, true, cx);
+                    }
+                } else {
+                    let reason = notification
+                        .params
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Login failed");
+                    self.auth_error = Some(reason.to_string());
+                }
+            }
+            "account/updated" => {
+                let auth_mode = notification.params.get("authMode").and_then(Value::as_str);
+                if auth_mode.is_none() {
+                    self.is_authenticated = false;
+                    self.account_email = None;
+                    self.account_plan_type = None;
+                    self.login_url = None;
+                    self.pending_login_id = None;
+                    self.login_in_progress = false;
+                    self.loading_auth_state = false;
+                    self.clear_workspace_state();
+                } else if let Some(server) = self._app_server.clone() {
+                    self.refresh_account_state(server, true, cx);
+                }
             }
             _ => {}
         }
@@ -1320,13 +1540,16 @@ impl AppShell {
 impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_load_threads(cx);
-        self.maybe_fetch_selected_thread_from_api(cx);
+        if self.is_authenticated {
+            self.maybe_fetch_selected_thread_from_api(cx);
+        }
 
         let workspace_groups = Self::group_threads_by_workspace(&self.threads, &self.cwd);
         let this = cx.entity().downgrade();
         let selected_id = self.selected_thread_id.clone();
         let can_send = !self.input_state.read(cx).value().trim().is_empty()
             && !self.sending_message
+            && self.is_authenticated
             && self._app_server.is_some();
 
         let thread_workspace_items = if self.loading_threads && self.threads.is_empty() {
@@ -1454,7 +1677,204 @@ impl Render for AppShell {
         let blue_color = app_theme.blue;
         let crust = app_theme.crust;
         let font_sans: gpui::SharedString = app_theme.font_sans.clone();
-        let font_mono: gpui::SharedString = app_theme.font_mono.clone();
+
+        if !self.is_authenticated {
+            let can_start_login =
+                self._app_server.is_some() && !self.loading_auth_state && !self.login_in_progress;
+            let primary_label = if self.loading_auth_state {
+                "Checking account..."
+            } else if self.login_in_progress {
+                "Waiting for login confirmation..."
+            } else {
+                "Continue with ChatGPT"
+            };
+            let login_status = if self.loading_auth_state {
+                "Checking your account..."
+            } else if self.login_in_progress {
+                "Waiting for login confirmation..."
+            } else if self._app_server.is_none() {
+                "Connecting to Codex app-server..."
+            } else {
+                "Log in to Agent Hub to view and use workspaces."
+            };
+            let show_login_url = self.login_url.is_some();
+            let auth_error = self.auth_error.clone().unwrap_or_default();
+            let show_auth_error = !auth_error.is_empty();
+            let account_email = self.account_email.clone().unwrap_or_default();
+            let show_account_email = !account_email.is_empty();
+            let account_plan_type = self.account_plan_type.clone().unwrap_or_default();
+            let show_account_plan_type = !account_plan_type.is_empty();
+            let hero_bg = hsl(220., 18., 95.);
+            let hero_text = hsl(220., 10., 10.);
+            let hero_subtext = hsl(220., 8., 50.);
+            let primary_bg = hsl(220., 10., 5.);
+            let disabled_bg = hsl(220., 12., 84.);
+            let secondary_border = hsl(220., 10., 84.);
+            let secondary_text = hsl(220., 10., 20.);
+            let icon_border = hsl(220., 12., 78.);
+
+            return div()
+                .size_full()
+                .font_family(font_sans)
+                .bg(hero_bg)
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(74.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().text_lg().text_color(hero_subtext).child("Agent Hub")),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .flex_1()
+                        .flex()
+                        .justify_center()
+                        .items_start()
+                        .pt(px(90.))
+                        .child(
+                            div()
+                                .w_full()
+                                .max_w(px(560.))
+                                .mx_auto()
+                                .px(px(24.))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(16.))
+                                .child(
+                                    div()
+                                        .size(px(74.))
+                                        .rounded(px(999.))
+                                        .border_1()
+                                        .border_color(icon_border)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Icon::new(IconName::Bot)
+                                                .size(px(34.))
+                                                .text_color(hero_text),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(8.))
+                                        .text_lg()
+                                        .text_color(hero_text)
+                                        .child("Welcome to Agent Hub"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(hero_subtext)
+                                        .child("Your workspace for building with agents"),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(12.))
+                                        .w_full()
+                                        .max_w(px(380.))
+                                        .h(px(56.))
+                                        .rounded(px(999.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(if can_start_login {
+                                            primary_bg
+                                        } else {
+                                            disabled_bg
+                                        })
+                                        .when(can_start_login, |this| {
+                                            this.cursor_pointer().on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(|view, _, _, cx| {
+                                                    view.start_login(cx);
+                                                }),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(hsl(0., 0., 98.))
+                                                .child(primary_label),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .max_w(px(380.))
+                                        .h(px(56.))
+                                        .rounded(px(999.))
+                                        .border_1()
+                                        .border_color(secondary_border)
+                                        .bg(hero_bg)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(|view, _, _, cx| {
+                                                view.auth_error = Some(
+                                                    "API key login is not implemented yet."
+                                                        .to_string(),
+                                                );
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(secondary_text)
+                                                .child("Enter API key"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(6.))
+                                        .text_sm()
+                                        .text_color(hero_subtext)
+                                        .child(login_status),
+                                )
+                                .when(show_login_url, |this| {
+                                    this.child(
+                                        div().text_sm().text_color(hero_subtext).child(
+                                            "A browser window was opened to complete sign in.",
+                                        ),
+                                    )
+                                })
+                                .when(show_account_email, |this| {
+                                    let account_email = account_email.clone();
+                                    this.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(hero_subtext)
+                                            .child(format!("Signed in as {account_email}")),
+                                    )
+                                })
+                                .when(show_account_plan_type, |this| {
+                                    let account_plan_type = account_plan_type.clone();
+                                    this.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(hero_subtext)
+                                            .child(format!("Plan: {account_plan_type}")),
+                                    )
+                                })
+                                .when(show_auth_error, |this| {
+                                    let auth_error = auth_error.clone();
+                                    this.child(
+                                        div().text_sm().text_color(red_color).child(auth_error),
+                                    )
+                                }),
+                        ),
+                );
+        }
 
         div()
             .size_full()

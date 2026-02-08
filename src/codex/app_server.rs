@@ -17,6 +17,10 @@ use serde_json::Value;
 pub enum RequestMethod {
     #[serde(rename = "initialize")]
     Initialize,
+    #[serde(rename = "account/read")]
+    AccountRead,
+    #[serde(rename = "account/login/start")]
+    AccountLoginStart,
     #[serde(rename = "thread/list")]
     ThreadList,
     #[serde(rename = "thread/start")]
@@ -31,6 +35,8 @@ impl RequestMethod {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Initialize => "initialize",
+            Self::AccountRead => "account/read",
+            Self::AccountLoginStart => "account/login/start",
             Self::ThreadList => "thread/list",
             Self::ThreadStart => "thread/start",
             Self::ThreadResume => "thread/resume",
