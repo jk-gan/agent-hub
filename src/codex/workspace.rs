@@ -114,9 +114,15 @@ mod tests {
         assert_eq!(workspace.path, "/tmp/repo");
 
         workspace.set_connection_state(WorkspaceConnectionState::Connecting);
-        assert_eq!(workspace.connection_state, WorkspaceConnectionState::Connecting);
+        assert_eq!(
+            workspace.connection_state,
+            WorkspaceConnectionState::Connecting
+        );
         workspace.set_connection_state(WorkspaceConnectionState::Connected);
-        assert_eq!(workspace.connection_state, WorkspaceConnectionState::Connected);
+        assert_eq!(
+            workspace.connection_state,
+            WorkspaceConnectionState::Connected
+        );
     }
 
     #[test]
