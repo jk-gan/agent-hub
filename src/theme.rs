@@ -113,26 +113,16 @@ impl Theme {
         cx.set_global(Self::load_theme(appearance));
     }
 
-    // pub fn request_method_color(&self, method: &RequestMethod) -> Hsla {
-    //     match method {
-    //         RequestMethod::Get => self.teal,
-    //         RequestMethod::Post => self.blue,
-    //         RequestMethod::Put => self.yellow,
-    //         RequestMethod::Delete => self.red,
-    //     }
-    // }
-
-    pub fn load_theme(_appearance: WindowAppearance) -> Theme {
-        catppuccin::PALETTE.get_flavor(FlavorName::Latte).into()
-        // match appearance {
-        //     gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => {
-        //         catppuccin::PALETTE.get_flavor(FlavorName::Latte)
-        //     }
-        //     gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => {
-        //         catppuccin::PALETTE.get_flavor(FlavorName::Mocha)
-        //     }
-        // }
-        // .into()
+    pub fn load_theme(appearance: WindowAppearance) -> Theme {
+        match appearance {
+            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => {
+                catppuccin::PALETTE.get_flavor(FlavorName::Latte)
+            }
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => {
+                catppuccin::PALETTE.get_flavor(FlavorName::Mocha)
+            }
+        }
+        .into()
     }
 
     pub fn sync_system_appearance(cx: &mut impl std::borrow::BorrowMut<App>) {

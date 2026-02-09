@@ -1,8 +1,8 @@
 use super::SidebarItem;
 use gpui::{
-    AnyElement, App, ClickEvent, ElementId, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled,
-    Window, div, percentage, prelude::FluentBuilder,
+    Animation, AnimationExt as _, AnyElement, App, ClickEvent, ElementId, InteractiveElement as _,
+    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled, Transformation, Window, div, percentage, prelude::FluentBuilder,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{ContextMenuExt, PopupMenu};
@@ -10,6 +10,7 @@ use gpui_component::{
     ActiveTheme as _, Collapsible, Icon, IconName, Sizable as _, StyledExt, h_flex, v_flex,
 };
 use std::rc::Rc;
+use std::time::Duration;
 
 /// Menu for the [`super::Sidebar`]
 #[derive(Clone)]
@@ -89,6 +90,7 @@ impl Styled for SidebarMenu {
 #[derive(Clone)]
 pub struct SidebarMenuItem {
     icon: Option<Icon>,
+    spin_icon: bool,
     label: SharedString,
     handler: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
     active: bool,
@@ -109,6 +111,7 @@ impl SidebarMenuItem {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
             icon: None,
+            spin_icon: false,
             label: label.into(),
             handler: Rc::new(|_, _, _| {}),
             active: false,
@@ -128,6 +131,12 @@ impl SidebarMenuItem {
     /// Set the icon for the menu item
     pub fn icon(mut self, icon: impl Into<Icon>) -> Self {
         self.icon = Some(icon.into());
+        self
+    }
+
+    /// Spin the icon continuously (useful for loading states).
+    pub fn spin_icon(mut self, spin_icon: bool) -> Self {
+        self.spin_icon = spin_icon;
         self
     }
 
@@ -212,14 +221,14 @@ impl SidebarMenuItem {
         self
     }
 
-    /// Set disabled flat for menu item.
+    /// Set disabled flag for menu item.
     pub fn disable(mut self, disable: bool) -> Self {
         self.disabled = disable;
         self
     }
 
     fn is_submenu(&self) -> bool {
-        self.children.len() > 0
+        !self.children.is_empty()
     }
 
     /// Set the context menu for the menu item.
@@ -257,6 +266,7 @@ impl SidebarItem for SidebarMenuItem {
         let default_open = self.default_open;
         let id = id.into();
         let hover_group = SharedString::from(format!("sidebar-item-{id}"));
+        let icon_animation_id = SharedString::from(format!("sidebar-item-icon-spin-{id}"));
         let open_state = window.use_keyed_state(id.clone(), cx, |_, _| default_open);
         let handler = self.handler.clone();
         let suffix_visible_on_hover = self.suffix_visible_on_hover;
@@ -267,6 +277,7 @@ impl SidebarItem for SidebarMenuItem {
         let is_disabled = self.disabled;
         let is_submenu = self.is_submenu();
         let is_open = is_submenu && !is_collapsed && *open_state.read(cx);
+        let spin_icon = self.spin_icon;
 
         div()
             .id(id.clone())
@@ -293,7 +304,19 @@ impl SidebarItem for SidebarMenuItem {
                             .bg(cx.theme().sidebar_accent)
                             .text_color(cx.theme().sidebar_accent_foreground)
                     })
-                    .when_some(self.icon.clone(), |this, icon| this.child(icon))
+                    .when_some(self.icon.clone(), |this, icon| {
+                        if spin_icon {
+                            this.child(icon.with_animation(
+                                icon_animation_id.clone(),
+                                Animation::new(Duration::from_secs(1)).repeat(),
+                                |icon, delta| {
+                                    icon.transform(Transformation::rotate(percentage(delta)))
+                                },
+                            ))
+                        } else {
+                            this.child(icon)
+                        }
+                    })
                     .when(is_collapsed, |this| {
                         this.justify_center().when(is_active, |this| {
                             this.bg(cx.theme().sidebar_accent)

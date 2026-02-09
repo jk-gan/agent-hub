@@ -1,5 +1,6 @@
 mod app_assets;
 mod codex;
+mod diff_view;
 mod sidebar;
 mod theme;
 
@@ -19,6 +20,7 @@ use gpui::{
 };
 use gpui_component::Root;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::highlighter::HighlightTheme;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::theme::{Theme as ComponentTheme, hsl};
@@ -117,12 +119,17 @@ enum ThreadSpeaker {
     Assistant,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum ThreadMessageKind {
     Text,
     CommandExecution {
         header: String,
         status_label: String,
+        expanded: bool,
+    },
+    FileChange {
+        status_label: String,
+        file_diffs: Vec<diff_view::ParsedFileDiff>,
         expanded: bool,
     },
 }
@@ -134,7 +141,7 @@ struct ThreadMessage {
     kind: ThreadMessageKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum RenderableMessage {
     Text {
         speaker: ThreadSpeaker,
@@ -144,6 +151,11 @@ enum RenderableMessage {
         header: String,
         status_label: String,
         content: String,
+        expanded: bool,
+    },
+    FileChange {
+        status_label: String,
+        file_diffs: Vec<diff_view::ParsedFileDiff>,
         expanded: bool,
     },
 }
@@ -175,8 +187,10 @@ struct AppShell {
     selected_thread_loaded_from_api_id: Option<String>,
     loading_selected_thread: bool,
     selected_thread_error: Option<String>,
-    sending_message: bool,
+    inflight_threads: HashSet<String>,
+    pending_new_thread: bool,
     streaming_message_ix: Option<usize>,
+    live_tool_message_ix_by_item_id: HashMap<String, usize>,
     scroll_handle: ScrollHandle,
     input_state: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -208,10 +222,10 @@ impl AppShell {
 
         let _subscriptions = vec![cx.subscribe_in(&input_state, window, {
             move |this: &mut Self, _, ev: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { secondary } = ev {
-                    if !*secondary {
-                        this.send_message(window, cx);
-                    }
+                if let InputEvent::PressEnter { secondary } = ev
+                    && !*secondary
+                {
+                    this.send_message(window, cx);
                 }
             }
         })];
@@ -243,8 +257,10 @@ impl AppShell {
             selected_thread_loaded_from_api_id: None,
             loading_selected_thread: false,
             selected_thread_error: None,
-            sending_message: false,
+            inflight_threads: HashSet::new(),
+            pending_new_thread: false,
             streaming_message_ix: None,
+            live_tool_message_ix_by_item_id: HashMap::new(),
             scroll_handle: ScrollHandle::new(),
             input_state,
             _subscriptions,
@@ -484,10 +500,10 @@ impl AppShell {
         cwd: &str,
         selected_id: Option<&str>,
     ) -> Option<ThreadRow> {
-        if let Some(selected_id) = selected_id {
-            if let Some(row) = threads.iter().find(|row| row.id == selected_id) {
-                return Some(row.clone());
-            }
+        if let Some(selected_id) = selected_id
+            && let Some(row) = threads.iter().find(|row| row.id == selected_id)
+        {
+            return Some(row.clone());
         }
 
         threads
@@ -542,6 +558,23 @@ impl AppShell {
                     },
                 }
             }
+            RenderableMessage::FileChange {
+                status_label,
+                file_diffs,
+                expanded,
+            } => {
+                let view_state = Self::new_message_state("", cx);
+                ThreadMessage {
+                    speaker: ThreadSpeaker::Assistant,
+                    content: String::new(),
+                    view_state,
+                    kind: ThreadMessageKind::FileChange {
+                        status_label,
+                        file_diffs,
+                        expanded,
+                    },
+                }
+            }
         }
     }
 
@@ -552,6 +585,124 @@ impl AppShell {
         raw.into_iter()
             .map(|message| Self::build_message_from_renderable(message, cx))
             .collect()
+    }
+
+    fn reset_live_tool_message_state(&mut self) {
+        self.live_tool_message_ix_by_item_id.clear();
+    }
+
+    fn update_thread_message_from_renderable(
+        message: &mut ThreadMessage,
+        renderable: RenderableMessage,
+        cx: &mut Context<Self>,
+    ) {
+        match renderable {
+            RenderableMessage::Text { speaker, content } => {
+                message.speaker = speaker;
+                message.content = content.clone();
+                message.view_state = Self::new_message_state(&content, cx);
+                message.kind = ThreadMessageKind::Text;
+            }
+            RenderableMessage::CommandExecution {
+                header,
+                status_label,
+                content,
+                expanded,
+            } => {
+                let next_expanded = match &message.kind {
+                    ThreadMessageKind::CommandExecution { expanded, .. } => *expanded,
+                    _ => expanded,
+                };
+
+                message.speaker = ThreadSpeaker::Assistant;
+                message.content = content.clone();
+                message.view_state = Self::new_message_state(&content, cx);
+                message.kind = ThreadMessageKind::CommandExecution {
+                    header,
+                    status_label,
+                    expanded: next_expanded,
+                };
+            }
+            RenderableMessage::FileChange {
+                status_label,
+                file_diffs,
+                expanded,
+            } => {
+                let next_expanded = match &message.kind {
+                    ThreadMessageKind::FileChange { expanded, .. } => *expanded,
+                    _ => expanded,
+                };
+
+                message.speaker = ThreadSpeaker::Assistant;
+                message.content = String::new();
+                message.view_state = Self::new_message_state("", cx);
+                message.kind = ThreadMessageKind::FileChange {
+                    status_label,
+                    file_diffs,
+                    expanded: next_expanded,
+                };
+            }
+        }
+    }
+
+    fn upsert_live_tool_message(
+        &mut self,
+        item_id: &str,
+        renderable: RenderableMessage,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self.live_tool_message_ix_by_item_id.get(item_id).copied()
+            && let Some(existing) = self.selected_thread_messages.get_mut(ix)
+        {
+            Self::update_thread_message_from_renderable(existing, renderable, cx);
+            self.scroll_handle.scroll_to_bottom();
+            return;
+        }
+
+        self.selected_thread_messages
+            .push(Self::build_message_from_renderable(renderable, cx));
+        let ix = self.selected_thread_messages.len() - 1;
+        self.live_tool_message_ix_by_item_id
+            .insert(item_id.to_string(), ix);
+        self.scroll_handle.scroll_to_bottom();
+    }
+
+    fn append_live_tool_output_delta(
+        &mut self,
+        item_id: &str,
+        delta: &str,
+        default_header: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if delta.is_empty() {
+            return;
+        }
+
+        if let Some(ix) = self.live_tool_message_ix_by_item_id.get(item_id).copied()
+            && let Some(existing) = self.selected_thread_messages.get_mut(ix)
+        {
+            if !existing.content.is_empty()
+                && !existing.content.ends_with('\n')
+                && !delta.starts_with('\n')
+            {
+                existing.content.push('\n');
+            }
+            existing.content.push_str(delta);
+            existing.view_state = Self::new_message_state(&existing.content, cx);
+            self.scroll_handle.scroll_to_bottom();
+            return;
+        }
+
+        self.upsert_live_tool_message(
+            item_id,
+            RenderableMessage::CommandExecution {
+                header: default_header.to_string(),
+                status_label: "Running".to_string(),
+                content: delta.to_string(),
+                expanded: true,
+            },
+            cx,
+        );
     }
 
     fn renderable_messages_from_session(path: &Path) -> Result<Vec<RenderableMessage>, String> {
@@ -647,9 +798,13 @@ impl AppShell {
         let raw_content = match &message {
             RenderableMessage::Text { content, .. } => content.as_str(),
             RenderableMessage::CommandExecution { content, .. } => content.as_str(),
+            RenderableMessage::FileChange { .. } => "",
         };
 
         let Some(content) = Self::budgeted_content(raw_content, used_chars, was_truncated) else {
+            if matches!(&message, RenderableMessage::FileChange { .. }) {
+                messages.push(message);
+            }
             return;
         };
 
@@ -666,6 +821,7 @@ impl AppShell {
                 content,
                 expanded,
             },
+            file_change @ RenderableMessage::FileChange { .. } => file_change,
         };
         messages.push(message);
     }
@@ -683,10 +839,10 @@ impl AppShell {
             ("bash -lc \"", "\""),
         ];
         for (prefix, suffix) in shell_wrappers {
-            if let Some(rest) = command.strip_prefix(prefix) {
-                if let Some(inner) = rest.strip_suffix(suffix) {
-                    return inner.to_string();
-                }
+            if let Some(rest) = command.strip_prefix(prefix)
+                && let Some(inner) = rest.strip_suffix(suffix)
+            {
+                return inner.to_string();
             }
         }
 
@@ -739,6 +895,52 @@ impl AppShell {
             ("declined", _) => "Declined".to_string(),
             _ => status.to_string(),
         }
+    }
+
+    fn file_change_status_label(status: &str) -> String {
+        match status {
+            "completed" => "Completed".to_string(),
+            "inProgress" => "Running".to_string(),
+            "failed" => "Failed".to_string(),
+            "declined" => "Declined".to_string(),
+            _ => status.to_string(),
+        }
+    }
+
+    fn format_file_change_item(item: &Value) -> Option<RenderableMessage> {
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let status_label = Self::file_change_status_label(status);
+        let file_diffs: Vec<diff_view::ParsedFileDiff> = item
+            .get("changes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|change| {
+                let path = change
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if path.is_empty() {
+                    return None;
+                }
+                let diff_text = change
+                    .get("diff")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default();
+                Some(diff_view::parse_unified_diff(path.to_string(), diff_text))
+            })
+            .collect();
+
+        Some(RenderableMessage::FileChange {
+            status_label,
+            file_diffs,
+            expanded: true,
+        })
     }
 
     fn format_command_execution_item(item: &Value) -> Option<RenderableMessage> {
@@ -813,25 +1015,22 @@ impl AppShell {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if query.is_empty() {
-            if let Some(action_query) = action_query {
-                query = action_query.to_string();
-            }
+        if query.is_empty()
+            && let Some(action_query) = action_query
+        {
+            query = action_query.to_string();
         }
-        if query.is_empty() {
-            if let Some(queries) = action
+        if query.is_empty()
+            && let Some(queries) = action
                 .and_then(|value| value.get("queries"))
                 .and_then(Value::as_array)
-            {
-                if let Some(first_query) = queries
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .find(|value| !value.is_empty())
-                {
-                    query = first_query.to_string();
-                }
-            }
+            && let Some(first_query) = queries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .find(|value| !value.is_empty())
+        {
+            query = first_query.to_string();
         }
 
         let url = action
@@ -858,6 +1057,7 @@ impl AppShell {
     fn renderable_message_from_tool_item(item: &Value) -> Option<RenderableMessage> {
         match item.get("type").and_then(Value::as_str) {
             Some("commandExecution") => Self::format_command_execution_item(item),
+            Some("fileChange") => Self::format_file_change_item(item),
             Some("webSearch") => {
                 Self::format_web_search_item(item).map(|content| RenderableMessage::Text {
                     speaker: ThreadSpeaker::Assistant,
@@ -929,7 +1129,7 @@ impl AppShell {
                             &mut was_truncated,
                         );
                     }
-                    Some("commandExecution") | Some("webSearch") => {
+                    Some("commandExecution") | Some("fileChange") | Some("webSearch") => {
                         let Some(tool_message) = Self::renderable_message_from_tool_item(item)
                         else {
                             continue;
@@ -1062,6 +1262,7 @@ impl AppShell {
             self.selected_thread_id = None;
             self.selected_thread_title = None;
             self.selected_thread_messages.clear();
+            self.reset_live_tool_message_state();
             self.selected_thread_loaded_from_api_id = None;
             self.loading_selected_thread = false;
             self.selected_thread_error = None;
@@ -1077,6 +1278,7 @@ impl AppShell {
 
         let Some(path) = row.path.as_deref() else {
             self.selected_thread_messages.clear();
+            self.reset_live_tool_message_state();
             self.selected_thread_error = Some("thread log path is unavailable".to_string());
             return;
         };
@@ -1084,10 +1286,12 @@ impl AppShell {
         match Self::renderable_messages_from_session(Path::new(path)) {
             Ok(raw) => {
                 self.selected_thread_messages = Self::build_messages_from_raw(raw, cx);
+                self.reset_live_tool_message_state();
                 self.selected_thread_error = None;
             }
             Err(error) => {
                 self.selected_thread_messages.clear();
+                self.reset_live_tool_message_state();
                 self.selected_thread_error = Some(format!("failed to load session: {error}"));
             }
         }
@@ -1096,6 +1300,13 @@ impl AppShell {
     fn select_thread_by_id(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         self.selected_thread_id = Some(thread_id.to_string());
         self.refresh_selected_thread(cx);
+    }
+
+    fn selected_thread_is_busy(&self) -> bool {
+        match self.selected_thread_id.as_deref() {
+            Some(thread_id) => self.inflight_threads.contains(thread_id),
+            None => self.pending_new_thread,
+        }
     }
 
     fn start_new_thread_in_workspace(&mut self, workspace_cwd: String, cx: &mut Context<Self>) {
@@ -1109,6 +1320,7 @@ impl AppShell {
         self.selected_thread_error = None;
         self.selected_thread_id = None;
         self.selected_thread_messages.clear();
+        self.reset_live_tool_message_state();
         self.selected_thread_title = Some("New thread".to_string());
         self.selected_thread_loaded_from_api_id = None;
         self.loading_selected_thread = false;
@@ -1140,10 +1352,10 @@ impl AppShell {
                         view.selected_thread_id = Some(id);
                         view.selected_thread_title = Some("New thread".to_string());
                         view.selected_thread_messages.clear();
+                        view.reset_live_tool_message_state();
                         view.selected_thread_error = None;
                         view.selected_thread_loaded_from_api_id = None;
                         view.loading_selected_thread = false;
-                        view.sending_message = false;
                         view.streaming_message_ix = None;
                         view.load_threads_from_server(Arc::clone(&server), cx);
                     }
@@ -1165,10 +1377,12 @@ impl AppShell {
         self.selected_thread_id = None;
         self.selected_thread_title = None;
         self.selected_thread_messages.clear();
+        self.reset_live_tool_message_state();
         self.selected_thread_loaded_from_api_id = None;
         self.loading_selected_thread = false;
         self.selected_thread_error = None;
-        self.sending_message = false;
+        self.inflight_threads.clear();
+        self.pending_new_thread = false;
         self.streaming_message_ix = None;
         self.loading_threads = false;
         self.thread_error = None;
@@ -1404,14 +1618,16 @@ impl AppShell {
 
     fn handle_notification(&mut self, notification: &ServerNotification, cx: &mut Context<Self>) {
         let notification_thread_id = notification.params.get("threadId").and_then(Value::as_str);
-        if let Some(notification_thread_id) = notification_thread_id {
-            if self.selected_thread_id.as_deref() != Some(notification_thread_id) {
-                return;
-            }
-        }
+        let applies_to_selected_thread = match notification_thread_id {
+            Some(thread_id) => self.selected_thread_id.as_deref() == Some(thread_id),
+            None => true,
+        };
 
         match notification.method.as_str() {
             "item/agentMessage/delta" => {
+                if !applies_to_selected_thread {
+                    return;
+                }
                 if let Some(delta) = notification.params.get("delta").and_then(Value::as_str) {
                     let ix = match self.streaming_message_ix {
                         Some(ix) => ix,
@@ -1436,18 +1652,60 @@ impl AppShell {
                     self.scroll_handle.scroll_to_bottom();
                 }
             }
+            "item/started" => {
+                if !applies_to_selected_thread {
+                    return;
+                }
+                if let Some(item) = notification.params.get("item")
+                    && let Some(item_id) = item.get("id").and_then(Value::as_str)
+                    && let Some(tool_message) = Self::renderable_message_from_tool_item(item)
+                {
+                    self.upsert_live_tool_message(item_id, tool_message, cx);
+                }
+            }
+            "item/commandExecution/outputDelta" => {
+                if !applies_to_selected_thread {
+                    return;
+                }
+                if let Some(item_id) = notification.params.get("itemId").and_then(Value::as_str)
+                    && let Some(delta) = notification.params.get("delta").and_then(Value::as_str)
+                {
+                    self.append_live_tool_output_delta(item_id, delta, "Ran command", cx);
+                }
+            }
+            "item/fileChange/outputDelta" => {
+                if !applies_to_selected_thread {
+                    return;
+                }
+                if let Some(item_id) = notification.params.get("itemId").and_then(Value::as_str)
+                    && let Some(delta) = notification.params.get("delta").and_then(Value::as_str)
+                {
+                    self.append_live_tool_output_delta(item_id, delta, "File changes", cx);
+                }
+            }
             "item/completed" => {
-                if let Some(item) = notification.params.get("item") {
-                    if let Some(tool_message) = Self::renderable_message_from_tool_item(item) {
-                        self.selected_thread_messages
-                            .push(Self::build_message_from_renderable(tool_message, cx));
-                        self.scroll_handle.scroll_to_bottom();
-                    }
+                if !applies_to_selected_thread {
+                    return;
+                }
+                if let Some(item) = notification.params.get("item")
+                    && let Some(tool_message) = Self::renderable_message_from_tool_item(item)
+                    && let Some(item_id) = item.get("id").and_then(Value::as_str)
+                {
+                    self.upsert_live_tool_message(item_id, tool_message, cx);
                 }
             }
             "turn/completed" => {
-                self.sending_message = false;
-                self.streaming_message_ix = None;
+                if let Some(thread_id) = notification_thread_id {
+                    self.inflight_threads.remove(thread_id);
+                } else if let Some(selected_thread_id) = self.selected_thread_id.as_deref() {
+                    self.inflight_threads.remove(selected_thread_id);
+                } else {
+                    self.pending_new_thread = false;
+                }
+
+                if applies_to_selected_thread {
+                    self.streaming_message_ix = None;
+                }
             }
             "account/login/completed" => {
                 let success = notification
@@ -1462,10 +1720,9 @@ impl AppShell {
                     .map(str::to_owned);
                 if let (Some(expected_login_id), Some(received_login_id)) =
                     (self.pending_login_id.as_deref(), login_id.as_deref())
+                    && expected_login_id != received_login_id
                 {
-                    if expected_login_id != received_login_id {
-                        return;
-                    }
+                    return;
                 }
 
                 self.pending_login_id = None;
@@ -1507,7 +1764,7 @@ impl AppShell {
     fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let text = text.trim().to_string();
-        if text.is_empty() || self.sending_message {
+        if text.is_empty() || self.selected_thread_is_busy() {
             return;
         }
 
@@ -1516,6 +1773,13 @@ impl AppShell {
             cx.notify();
             return;
         };
+
+        let thread_id = self.selected_thread_id.clone();
+        if let Some(thread_id) = thread_id.as_deref() {
+            self.inflight_threads.insert(thread_id.to_string());
+        } else {
+            self.pending_new_thread = true;
+        }
 
         self.input_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -1527,12 +1791,15 @@ impl AppShell {
                 text.clone(),
                 cx,
             ));
-        self.sending_message = true;
         self.streaming_message_ix = None;
         cx.notify();
 
-        let thread_id = self.selected_thread_id.clone();
-        let cwd = self.cwd.clone();
+        let cwd = thread_id
+            .as_deref()
+            .and_then(|thread_id| self.threads.iter().find(|thread| thread.id == thread_id))
+            .map(|thread| thread.cwd.clone())
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or_else(|| self.cwd.clone());
 
         cx.spawn(async move |view, cx| {
             let thread_id = if let Some(id) = thread_id {
@@ -1551,25 +1818,33 @@ impl AppShell {
                             .to_string();
                         if id.is_empty() {
                             let _ = view.update(cx, |view, cx| {
-                                view.sending_message = false;
-                                view.selected_thread_error =
-                                    Some("thread/start returned no thread id".to_string());
+                                view.pending_new_thread = false;
+                                if view.selected_thread_id.is_none() {
+                                    view.selected_thread_error =
+                                        Some("thread/start returned no thread id".to_string());
+                                }
                                 cx.notify();
                             });
                             return;
                         }
                         let _ = view.update(cx, |view, cx| {
-                            view.selected_thread_id = Some(id.clone());
-                            view.selected_thread_title = Some("New thread".to_string());
+                            view.pending_new_thread = false;
+                            view.inflight_threads.insert(id.clone());
+                            if view.selected_thread_id.is_none() {
+                                view.selected_thread_id = Some(id.clone());
+                                view.selected_thread_title = Some("New thread".to_string());
+                            }
                             cx.notify();
                         });
                         id
                     }
                     Err(error) => {
                         let _ = view.update(cx, |view, cx| {
-                            view.sending_message = false;
-                            view.selected_thread_error =
-                                Some(format!("thread/start failed: {error}"));
+                            view.pending_new_thread = false;
+                            if view.selected_thread_id.is_none() {
+                                view.selected_thread_error =
+                                    Some(format!("thread/start failed: {error}"));
+                            }
                             cx.notify();
                         });
                         return;
@@ -1584,6 +1859,7 @@ impl AppShell {
                         "threadId": thread_id,
                         "input": [{ "type": "text", "text": text }],
                         "cwd": cwd,
+                        "approvalPolicy": "never",
                     }),
                 )
                 .await;
@@ -1591,11 +1867,16 @@ impl AppShell {
             let _ = view.update(cx, |view, cx| {
                 match result {
                     Ok(_payload) => {
-                        view.selected_thread_error = None;
+                        if view.selected_thread_id.as_deref() == Some(thread_id.as_str()) {
+                            view.selected_thread_error = None;
+                        }
                     }
                     Err(error) => {
-                        view.sending_message = false;
-                        view.selected_thread_error = Some(format!("turn/start failed: {error}"));
+                        view.inflight_threads.remove(thread_id.as_str());
+                        if view.selected_thread_id.as_deref() == Some(thread_id.as_str()) {
+                            view.selected_thread_error =
+                                Some(format!("turn/start failed: {error}"));
+                        }
                     }
                 }
                 cx.notify();
@@ -1616,7 +1897,7 @@ impl Render for AppShell {
         let this = cx.entity().downgrade();
         let selected_id = self.selected_thread_id.clone();
         let can_send = !self.input_state.read(cx).value().trim().is_empty()
-            && !self.sending_message
+            && !self.selected_thread_is_busy()
             && self.is_authenticated
             && self._app_server.is_some();
 
@@ -1655,8 +1936,14 @@ impl Render for AppShell {
                 let mut children = Vec::new();
                 children.extend(group.threads.iter().take(visible_count).map(|row| {
                     let is_active = selected_id.as_deref() == Some(row.id.as_str());
+                    let is_running = self.inflight_threads.contains(row.id.as_str());
                     let mut item = SidebarMenuItem::new(row.title.clone())
-                        .icon(IconName::Bot)
+                        .icon(if is_running {
+                            IconName::LoaderCircle
+                        } else {
+                            IconName::Bot
+                        })
+                        .spin_icon(is_running)
                         .active(is_active)
                         .on_click({
                             let this = this.clone();
@@ -1771,6 +2058,7 @@ impl Render for AppShell {
         };
 
         let app_theme = cx.global::<AppTheme>();
+        let is_dark = app_theme.mode.is_dark();
         let sidebar_bg = app_theme.mantle;
         let divider_color = app_theme.surface0;
         let content_bg = app_theme.base;
@@ -1781,9 +2069,16 @@ impl Render for AppShell {
         let surface1 = app_theme.surface1;
         let mantle = app_theme.mantle;
         let red_color = app_theme.red;
+        let green_color = app_theme.green;
         let blue_color = app_theme.blue;
         let crust = app_theme.crust;
         let font_sans: gpui::SharedString = app_theme.font_sans.clone();
+        let font_mono: gpui::SharedString = app_theme.font_mono.clone();
+        let highlight_theme = if is_dark {
+            HighlightTheme::default_dark()
+        } else {
+            HighlightTheme::default_light()
+        };
 
         if !self.is_authenticated {
             let can_start_login =
@@ -2143,7 +2438,11 @@ impl Render for AppShell {
                                                                                 &message.view_state,
                                                                             )
                                                                             .style(
-                                                                                TextViewStyle::default()
+                                                                                TextViewStyle {
+                                                                                    highlight_theme: highlight_theme.clone(),
+                                                                                    is_dark,
+                                                                                    ..TextViewStyle::default()
+                                                                                }
                                                                                     .code_block(
                                                                                         gpui::StyleRefinement::default()
                                                                                             .bg(mantle)
@@ -2158,9 +2457,9 @@ impl Render for AppShell {
                                                                                             .px(px(12.))
                                                                                             .py(px(10.)),
                                                                                     ),
-                                                                            )
-                                                                            .text_color(text_color)
-                                                                            .selectable(true),
+                                                                                )
+                                                                                .text_color(text_color)
+                                                                                .selectable(true),
                                                                         ),
                                                                 )
                                                                 .into_any_element(),
@@ -2202,7 +2501,11 @@ impl Render for AppShell {
                                                                                                 &message.view_state,
                                                                                             )
                                                                                             .style(
-                                                                                                TextViewStyle::default()
+                                                                                                TextViewStyle {
+                                                                                                    highlight_theme: highlight_theme.clone(),
+                                                                                                    is_dark,
+                                                                                                    ..TextViewStyle::default()
+                                                                                                }
                                                                                                     .code_block(
                                                                                                         gpui::StyleRefinement::default()
                                                                                                             .bg(surface0)
@@ -2224,16 +2527,220 @@ impl Render for AppShell {
                                                                                             if let Some(message) = view
                                                                                                 .selected_thread_messages
                                                                                                 .get_mut(message_ix)
-                                                                                            {
-                                                                                                if let ThreadMessageKind::CommandExecution {
+                                                                                                && let ThreadMessageKind::CommandExecution {
                                                                                                     expanded,
                                                                                                     ..
                                                                                                 } = &mut message.kind
-                                                                                                {
-                                                                                                    *expanded = open_ixs
-                                                                                                        .contains(&0);
-                                                                                                    cx.notify();
-                                                                                                }
+                                                                                            {
+                                                                                                *expanded = open_ixs
+                                                                                                    .contains(&0);
+                                                                                                cx.notify();
+                                                                                            }
+                                                                                        },
+                                                                                    ),
+                                                                                ),
+                                                                            ),
+                                                                    )
+                                                                    .into_any_element()
+                                                            }
+                                                            ThreadMessageKind::FileChange {
+                                                                status_label,
+                                                                file_diffs,
+                                                                expanded,
+                                                            } => {
+                                                                let file_change_accordion_id =
+                                                                    format!(
+                                                                        "file-change-{message_ix}"
+                                                                    );
+                                                                let status_label = status_label.clone();
+                                                                let expanded = *expanded;
+                                                                let file_diffs = file_diffs.clone();
+                                                                let total_files = file_diffs.len();
+                                                                let font_mono = font_mono.clone();
+
+                                                                let added_bg = gpui::Hsla { a: 0.12, ..green_color };
+                                                                let removed_bg = gpui::Hsla { a: 0.12, ..red_color };
+
+                                                                div()
+                                                                    .w_full()
+                                                                    .mb(px(16.))
+                                                                    .flex()
+                                                                    .justify_start()
+                                                                    .child(
+                                                                        div()
+                                                                            .w_full()
+                                                                            .max_w(px(860.))
+                                                                            .child(
+                                                                                gpui_component::accordion::Accordion::new(
+                                                                                    file_change_accordion_id,
+                                                                                )
+                                                                                .item(|this| {
+                                                                                    let header_text = if total_files == 1 {
+                                                                                        format!("1 file changed · {status_label}")
+                                                                                    } else {
+                                                                                        format!("{total_files} files changed · {status_label}")
+                                                                                    };
+
+                                                                                    this
+                                                                                        .open(expanded)
+                                                                                        .title(header_text)
+                                                                                        .child(
+                                                                                            div()
+                                                                                                .flex()
+                                                                                                .flex_col()
+                                                                                                .gap(px(12.))
+                                                                                                .children(
+                                                                                                    file_diffs.iter().map(|file_diff| {
+                                                                                                        let total_add = file_diff.additions;
+                                                                                                        let total_del = file_diff.deletions;
+                                                                                                        let path = file_diff.path.clone();
+                                                                                                        let font_mono = font_mono.clone();
+
+                                                                                                        div()
+                                                                                                            .flex()
+                                                                                                            .flex_col()
+                                                                                                            .rounded(px(8.))
+                                                                                                            .border_1()
+                                                                                                            .border_color(surface1)
+                                                                                                            .overflow_hidden()
+                                                                                                            .child(
+                                                                                                                div()
+                                                                                                                    .w_full()
+                                                                                                                    .px(px(12.))
+                                                                                                                    .py(px(8.))
+                                                                                                                    .bg(surface0)
+                                                                                                                    .border_b_1()
+                                                                                                                    .border_color(surface1)
+                                                                                                                    .flex()
+                                                                                                                    .items_center()
+                                                                                                                    .gap(px(8.))
+                                                                                                                    .text_sm()
+                                                                                                                    .child(
+                                                                                                                        div()
+                                                                                                                            .font_family(font_mono.clone())
+                                                                                                                            .text_color(text_color)
+                                                                                                                            .child(path),
+                                                                                                                    )
+                                                                                                                    .child(
+                                                                                                                        div()
+                                                                                                                            .flex()
+                                                                                                                            .gap(px(6.))
+                                                                                                                            .child(
+                                                                                                                                div()
+                                                                                                                                    .text_color(green_color)
+                                                                                                                                    .child(format!("+{total_add}")),
+                                                                                                                            )
+                                                                                                                            .child(
+                                                                                                                                div()
+                                                                                                                                    .text_color(red_color)
+                                                                                                                                    .child(format!("-{total_del}")),
+                                                                                                                            ),
+                                                                                                                    ),
+                                                                                                            )
+                                                                                                            .child(
+                                                                                                                div()
+                                                                                                                    .w_full()
+                                                                                                                    .overflow_x_hidden()
+                                                                                                                    .child(
+                                                                                                                        div()
+                                                                                                                            .flex()
+                                                                                                                            .flex_col()
+                                                                                                                            .font_family(font_mono.clone())
+                                                                                                                            .text_sm()
+                                                                                                                            .children(
+                                                                                                                                file_diff.rows.iter().map(|row| {
+                                                                                                                                    match row {
+                                                                                                                                        diff_view::DiffRow::HunkHeader(h) => {
+                                                                                                                                            div()
+                                                                                                                                                .w_full()
+                                                                                                                                                .px(px(12.))
+                                                                                                                                                .py(px(4.))
+                                                                                                                                                .bg(surface0)
+                                                                                                                                                .text_color(subtext_color)
+                                                                                                                                                .text_xs()
+                                                                                                                                                .child(h.raw.clone())
+                                                                                                                                                .into_any_element()
+                                                                                                                                        }
+                                                                                                                                        diff_view::DiffRow::Line(line) => {
+                                                                                                                                            let (row_bg, bar_color) = match line.kind {
+                                                                                                                                                diff_view::DiffLineKind::Added => (added_bg, green_color),
+                                                                                                                                                diff_view::DiffLineKind::Removed => (removed_bg, red_color),
+                                                                                                                                                diff_view::DiffLineKind::Context => (gpui::Hsla::transparent_black(), gpui::Hsla::transparent_black()),
+                                                                                                                                            };
+
+                                                                                                                                            let old_ln = line.old_lineno.map_or_else(|| "\u{00A0}".to_string(), |n| n.to_string());
+                                                                                                                                            let new_ln = line.new_lineno.map_or_else(|| "\u{00A0}".to_string(), |n| n.to_string());
+
+                                                                                                                                            let display_text = if line.text.is_empty() {
+                                                                                                                                                "\u{00A0}".to_string()
+                                                                                                                                            } else {
+                                                                                                                                                line.text.replace(' ', "\u{00A0}")
+                                                                                                                                            };
+
+                                                                                                                                            div()
+                                                                                                                                                .w_full()
+                                                                                                                                                .flex()
+                                                                                                                                                .flex_row()
+                                                                                                                                                .bg(row_bg)
+                                                                                                                                                .child(
+                                                                                                                                                    div()
+                                                                                                                                                        .w(px(3.))
+                                                                                                                                                        .h_full()
+                                                                                                                                                        .bg(bar_color),
+                                                                                                                                                )
+                                                                                                                                                .child(
+                                                                                                                                                    div()
+                                                                                                                                                        .w(px(44.))
+                                                                                                                                                        .flex_shrink_0()
+                                                                                                                                                        .px(px(6.))
+                                                                                                                                                        .py(px(1.))
+                                                                                                                                                        .text_color(subtext_color)
+                                                                                                                                                        .text_right()
+                                                                                                                                                        .child(old_ln),
+                                                                                                                                                )
+                                                                                                                                                .child(
+                                                                                                                                                    div()
+                                                                                                                                                        .w(px(44.))
+                                                                                                                                                        .flex_shrink_0()
+                                                                                                                                                        .px(px(6.))
+                                                                                                                                                        .py(px(1.))
+                                                                                                                                                        .text_color(subtext_color)
+                                                                                                                                                        .text_right()
+                                                                                                                                                        .child(new_ln),
+                                                                                                                                                )
+                                                                                                                                                .child(
+                                                                                                                                                    div()
+                                                                                                                                                        .flex_1()
+                                                                                                                                                        .px(px(8.))
+                                                                                                                                                        .py(px(1.))
+                                                                                                                                                        .text_color(text_color)
+                                                                                                                                                        .child(display_text),
+                                                                                                                                                )
+                                                                                                                                                .into_any_element()
+                                                                                                                                        }
+                                                                                                                                    }
+                                                                                                                                }),
+                                                                                                                            ),
+                                                                                                                    ),
+                                                                                                            )
+                                                                                                    }),
+                                                                                                ),
+                                                                                        )
+                                                                                })
+                                                                                .on_toggle_click(
+                                                                                    cx.listener(
+                                                                                        move |view, open_ixs: &[usize], _, cx| {
+                                                                                            if let Some(message) = view
+                                                                                                .selected_thread_messages
+                                                                                                .get_mut(message_ix)
+                                                                                                && let ThreadMessageKind::FileChange {
+                                                                                                    expanded,
+                                                                                                    ..
+                                                                                                } = &mut message.kind
+                                                                                            {
+                                                                                                *expanded = open_ixs
+                                                                                                    .contains(&0);
+                                                                                                cx.notify();
                                                                                             }
                                                                                         },
                                                                                     ),
@@ -2316,7 +2823,7 @@ impl Render for AppShell {
                                                 .h_full()
                                                 .text_color(text_color)
                                                 .disabled(
-                                                    self.sending_message
+                                                    self.selected_thread_is_busy()
                                                         || self._app_server.is_none(),
                                                 ),
                                         ),
@@ -2421,13 +2928,18 @@ fn main() {
         gpui_component::init(cx);
         AppTheme::init(cx);
         let app_theme = cx.global::<AppTheme>();
+        let is_dark = app_theme.mode.is_dark();
         let text_color = app_theme.text;
         let blue_color = app_theme.blue;
+        let surface1 = app_theme.surface1;
+        if is_dark {
+            ComponentTheme::change(gpui_component::theme::ThemeMode::Dark, None, cx);
+        }
         let theme = ComponentTheme::global_mut(cx);
         theme.foreground = text_color;
         theme.caret = text_color;
-        theme.accent = hsl(210., 26., 88.);
-        theme.accent_foreground = hsl(220., 18., 20.);
+        theme.accent = surface1;
+        theme.accent_foreground = text_color;
         theme.link = blue_color;
         theme.link_hover = blue_color;
 
@@ -2531,6 +3043,44 @@ mod tests {
     }
 
     #[test]
+    fn format_file_change_item_renders_paths_and_diff() {
+        let item = json!({
+            "type": "fileChange",
+            "status": "inProgress",
+            "changes": [
+                {
+                    "path": "/tmp/repo/README.md",
+                    "kind": { "type": "add" },
+                    "diff": "### Agent Hub\n"
+                },
+                {
+                    "path": "/tmp/repo/src/main.rs",
+                    "kind": { "type": "update" },
+                    "diff": "@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\n"
+                }
+            ]
+        });
+
+        let rendered = AppShell::format_file_change_item(&item).expect("should render");
+        match rendered {
+            RenderableMessage::FileChange {
+                status_label,
+                file_diffs,
+                expanded,
+            } => {
+                assert_eq!(status_label, "Running");
+                assert!(expanded);
+                assert_eq!(file_diffs.len(), 2);
+                assert_eq!(file_diffs[0].path, "/tmp/repo/README.md");
+                assert_eq!(file_diffs[1].path, "/tmp/repo/src/main.rs");
+                assert_eq!(file_diffs[1].additions, 1);
+                assert_eq!(file_diffs[1].deletions, 1);
+            }
+            other => panic!("expected file change renderable message, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn renderable_messages_from_thread_response_includes_tool_items() {
         let payload = json!({
             "thread": {
@@ -2564,6 +3114,18 @@ mod tests {
                                 }
                             },
                             {
+                                "type": "fileChange",
+                                "id": "f1",
+                                "status": "completed",
+                                "changes": [
+                                    {
+                                        "path": "/tmp/repo/README.md",
+                                        "kind": { "type": "add" },
+                                        "diff": "### Agent Hub\n"
+                                    }
+                                ]
+                            },
+                            {
                                 "type": "agentMessage",
                                 "id": "a1",
                                 "text": "done"
@@ -2576,7 +3138,7 @@ mod tests {
 
         let messages = AppShell::renderable_messages_from_thread_response(&payload)
             .expect("thread response should parse");
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 5);
         assert!(matches!(
             &messages[0],
             RenderableMessage::Text {
@@ -2595,8 +3157,9 @@ mod tests {
                 content,
             } if content.contains("**Web search**")
         ));
+        assert!(matches!(&messages[3], RenderableMessage::FileChange { .. }));
         assert!(matches!(
-            &messages[3],
+            &messages[4],
             RenderableMessage::Text {
                 speaker: ThreadSpeaker::Assistant,
                 content,
