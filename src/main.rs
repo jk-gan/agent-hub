@@ -21,7 +21,11 @@ use gpui::{
 use gpui_component::Root;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::highlighter::HighlightTheme;
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{
+    Enter as InputEnter, Input, InputEvent, InputState, MoveDown as InputMoveDown,
+    MoveUp as InputMoveUp, Position,
+};
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::theme::{Theme as ComponentTheme, hsl};
 use gpui_component::{Icon, IconName, Sizable as _};
@@ -96,6 +100,154 @@ struct ThreadListItem {
     updated_at: Option<u64>,
     cwd: Option<String>,
     path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillsListResponse {
+    #[serde(default)]
+    data: Vec<SkillsListWorkspaceItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillsListWorkspaceItem {
+    cwd: String,
+    #[serde(default)]
+    skills: Vec<SkillListItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillListItem {
+    name: String,
+    #[serde(default)]
+    description: String,
+    path: String,
+    #[serde(default)]
+    short_description: Option<String>,
+    #[serde(default)]
+    scope: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone)]
+struct SkillOption {
+    name: String,
+    description: String,
+    path: String,
+    scope: String,
+}
+
+#[derive(Debug, Clone)]
+struct SkillPickerState {
+    items: Vec<SkillOption>,
+}
+
+fn is_skill_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')
+}
+
+fn skill_token_before_cursor(prefix: &str) -> Option<(usize, String)> {
+    let mut start = prefix.len();
+    while start > 0 {
+        let (prev_ix, prev_ch) = prefix[..start].char_indices().next_back()?;
+        if !is_skill_name_char(prev_ch) {
+            break;
+        }
+        start = prev_ix;
+    }
+
+    if start == 0 {
+        return None;
+    }
+
+    let (dollar_ix, dollar_ch) = prefix[..start].char_indices().next_back()?;
+    if dollar_ch != '$' {
+        return None;
+    }
+
+    if dollar_ix > 0
+        && let Some((_, prev_char)) = prefix[..dollar_ix].char_indices().next_back()
+        && (is_skill_name_char(prev_char) || prev_char == '$')
+    {
+        return None;
+    }
+
+    let query = prefix[start..].to_string();
+    Some((dollar_ix, query))
+}
+
+fn extract_skill_mentions(text: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < text.len() {
+        let Some(rel_ix) = text[cursor..].find('$') else {
+            break;
+        };
+        let dollar_ix = cursor + rel_ix;
+
+        if dollar_ix > 0
+            && let Some((_, prev_char)) = text[..dollar_ix].char_indices().next_back()
+            && (is_skill_name_char(prev_char) || prev_char == '$')
+        {
+            cursor = dollar_ix + 1;
+            continue;
+        }
+
+        let mut end = dollar_ix + 1;
+        while end < text.len() {
+            let Some(next_char) = text[end..].chars().next() else {
+                break;
+            };
+            if !is_skill_name_char(next_char) {
+                break;
+            }
+            end += next_char.len_utf8();
+        }
+
+        if end > dollar_ix + 1 {
+            mentions.push(text[(dollar_ix + 1)..end].to_string());
+        }
+
+        cursor = end.max(dollar_ix + 1);
+    }
+
+    mentions
+}
+
+fn input_position_for_offset(text: &str, offset: usize) -> Position {
+    let clamped_offset = offset.min(text.len());
+    let mut line = 0u32;
+    let mut character = 0u32;
+    let mut consumed = 0usize;
+
+    for ch in text.chars() {
+        if consumed >= clamped_offset {
+            break;
+        }
+
+        let len = ch.len_utf8();
+        if consumed + len > clamped_offset {
+            break;
+        }
+
+        if ch == '\n' {
+            line += 1;
+            character = 0;
+        } else {
+            character += ch.len_utf16() as u32;
+        }
+        consumed += len;
+    }
+
+    Position::new(line, character)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -189,8 +341,15 @@ struct AppShell {
     selected_thread_error: Option<String>,
     inflight_threads: HashSet<String>,
     pending_new_thread: bool,
+    composing_new_thread_cwd: Option<String>,
     streaming_message_ix: Option<usize>,
     live_tool_message_ix_by_item_id: HashMap<String, usize>,
+    skills_by_cwd: HashMap<String, Vec<SkillOption>>,
+    loading_skills_cwds: HashSet<String>,
+    active_skills_cwd: String,
+    active_skills: Vec<SkillOption>,
+    skill_picker_selected_ix: usize,
+    skill_picker_scroll_handle: ScrollHandle,
     scroll_handle: ScrollHandle,
     input_state: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -221,12 +380,18 @@ impl AppShell {
         });
 
         let _subscriptions = vec![cx.subscribe_in(&input_state, window, {
-            move |this: &mut Self, _, ev: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { secondary } = ev
-                    && !*secondary
-                {
+            move |this: &mut Self, _, ev: &InputEvent, window, cx| match ev {
+                InputEvent::Change => {
+                    this.skill_picker_selected_ix = 0;
+                    this.skill_picker_scroll_handle.scroll_to_item(0);
+                }
+                InputEvent::PressEnter { secondary } if !*secondary => {
+                    if this.apply_selected_skill_completion_if_open(window, cx) {
+                        return;
+                    }
                     this.send_message(window, cx);
                 }
+                _ => {}
             }
         })];
 
@@ -243,7 +408,7 @@ impl AppShell {
             loading_threads: false,
             sidebar_collapsed: false,
             thread_error,
-            cwd,
+            cwd: cwd.clone(),
             cache_path,
             raw_cache_path,
             thread_content_cache_path,
@@ -259,8 +424,15 @@ impl AppShell {
             selected_thread_error: None,
             inflight_threads: HashSet::new(),
             pending_new_thread: false,
+            composing_new_thread_cwd: None,
             streaming_message_ix: None,
             live_tool_message_ix_by_item_id: HashMap::new(),
+            skills_by_cwd: HashMap::new(),
+            loading_skills_cwds: HashSet::new(),
+            active_skills_cwd: cwd.clone(),
+            active_skills: Vec::new(),
+            skill_picker_selected_ix: 0,
+            skill_picker_scroll_handle: ScrollHandle::new(),
             scroll_handle: ScrollHandle::new(),
             input_state,
             _subscriptions,
@@ -325,6 +497,268 @@ impl AppShell {
             return format!("{prefix}-workspace");
         }
         format!("{prefix}-{suffix}")
+    }
+
+    fn active_composer_cwd(&self) -> String {
+        if let Some(cwd) = &self.composing_new_thread_cwd {
+            return cwd.clone();
+        }
+
+        self.selected_thread_id
+            .as_deref()
+            .and_then(|thread_id| self.threads.iter().find(|thread| thread.id == thread_id))
+            .map(|thread| thread.cwd.clone())
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    fn set_active_skills_for_cwd(&mut self, cwd: &str) {
+        self.active_skills_cwd = cwd.to_string();
+        self.active_skills = self.skills_by_cwd.get(cwd).cloned().unwrap_or_default();
+    }
+
+    fn parse_skills_for_cwd(payload: Value, cwd: &str) -> Result<Vec<SkillOption>, String> {
+        let response: SkillsListResponse = serde_json::from_value(payload)
+            .map_err(|error| format!("invalid response: {error}"))?;
+
+        let mut workspaces = response.data.into_iter();
+        let first_workspace = workspaces.next();
+        let workspace = first_workspace
+            .map(|first| {
+                if first.cwd == cwd {
+                    first
+                } else {
+                    workspaces
+                        .find(|workspace| workspace.cwd == cwd)
+                        .unwrap_or(first)
+                }
+            })
+            .ok_or_else(|| "skills/list returned no workspace entries".to_string())?;
+
+        let mut skills = workspace
+            .skills
+            .into_iter()
+            .filter(|skill| skill.enabled)
+            .filter_map(|skill| {
+                let name = skill.name.trim();
+                let path = skill.path.trim();
+                if name.is_empty() || path.is_empty() {
+                    return None;
+                }
+
+                let description = if skill.description.trim().is_empty() {
+                    skill.short_description.unwrap_or_default()
+                } else {
+                    skill.description
+                };
+
+                Some(SkillOption {
+                    name: name.to_string(),
+                    description: description.trim().to_string(),
+                    path: path.to_string(),
+                    scope: skill.scope.trim().to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(skills)
+    }
+
+    fn ensure_skills_for_cwd(&mut self, cwd: String, cx: &mut Context<Self>) {
+        if self.active_skills_cwd != cwd {
+            self.set_active_skills_for_cwd(&cwd);
+        }
+
+        if self.skills_by_cwd.contains_key(&cwd) || self.loading_skills_cwds.contains(&cwd) {
+            return;
+        }
+
+        let Some(server) = self._app_server.clone() else {
+            return;
+        };
+
+        self.loading_skills_cwds.insert(cwd.clone());
+        cx.spawn(async move |view, cx| {
+            let response = server
+                .call(RequestMethod::SkillsList, json!({ "cwds": [cwd.clone()] }))
+                .await;
+
+            let _ = view.update(cx, |view, _cx| {
+                view.loading_skills_cwds.remove(&cwd);
+                if let Ok(payload) = response
+                    && let Ok(skills) = Self::parse_skills_for_cwd(payload, &cwd)
+                {
+                    view.skills_by_cwd.insert(cwd.clone(), skills.clone());
+                    if view.active_skills_cwd == cwd {
+                        view.active_skills = skills;
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn ensure_skills_for_active_workspace(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.active_composer_cwd();
+        self.ensure_skills_for_cwd(cwd, cx);
+    }
+
+    fn skill_input_items_for_text(&self, text: &str) -> Vec<Value> {
+        let first_skill_by_name = self
+            .active_skills
+            .iter()
+            .map(|skill| (skill.name.as_str(), skill))
+            .collect::<HashMap<_, _>>();
+
+        let mut seen = HashSet::new();
+        extract_skill_mentions(text)
+            .into_iter()
+            .filter_map(|skill_name| {
+                if !seen.insert(skill_name.clone()) {
+                    return None;
+                }
+                let skill = first_skill_by_name.get(skill_name.as_str())?;
+                Some(json!({
+                    "type": "skill",
+                    "name": &skill.name,
+                    "path": &skill.path,
+                }))
+            })
+            .collect()
+    }
+
+    fn current_skill_picker_state(&self, cx: &App) -> Option<SkillPickerState> {
+        let (text, cursor) = {
+            let input = self.input_state.read(cx);
+            (input.value().to_string(), input.cursor())
+        };
+
+        let prefix = text.get(..cursor)?;
+        let (_, query) = skill_token_before_cursor(prefix)?;
+
+        let query_lower = query.to_ascii_lowercase();
+        let mut filtered = self
+            .active_skills
+            .iter()
+            .cloned()
+            .filter_map(|skill| {
+                let name_lower = skill.name.to_ascii_lowercase();
+                if query_lower.is_empty() {
+                    return Some((0u8, skill));
+                }
+                if name_lower.starts_with(&query_lower) {
+                    return Some((0u8, skill));
+                }
+                if name_lower.contains(&query_lower) {
+                    return Some((1u8, skill));
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+
+        filtered.sort_by(|(score_a, skill_a), (score_b, skill_b)| {
+            score_a
+                .cmp(score_b)
+                .then_with(|| skill_a.name.cmp(&skill_b.name))
+        });
+
+        let items = filtered
+            .into_iter()
+            .map(|(_, skill)| skill)
+            .take(60)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            return None;
+        }
+
+        Some(SkillPickerState { items })
+    }
+
+    fn apply_skill_completion(
+        &mut self,
+        skill_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (text, cursor) = {
+            let input = self.input_state.read(cx);
+            (input.value().to_string(), input.cursor())
+        };
+
+        let Some(prefix) = text.get(..cursor) else {
+            return false;
+        };
+        let Some((dollar_ix, _query)) = skill_token_before_cursor(prefix) else {
+            return false;
+        };
+
+        let token_start = dollar_ix + 1;
+        if token_start > cursor || cursor > text.len() {
+            return false;
+        }
+
+        let mut token_end = cursor;
+        while token_end < text.len() {
+            let Some(next_char) = text[token_end..].chars().next() else {
+                break;
+            };
+            if !is_skill_name_char(next_char) {
+                break;
+            }
+            token_end += next_char.len_utf8();
+        }
+
+        let before = &text[..token_start];
+        let after = &text[token_end..];
+        let trailing_space = if after.is_empty() { " " } else { "" };
+        let replaced = format!("{before}{skill_name}{trailing_space}{after}");
+        let next_cursor = before.len() + skill_name.len() + trailing_space.len();
+
+        self.input_state.update(cx, move |state, cx| {
+            state.set_value(replaced.clone(), window, cx);
+            state.set_cursor_position(
+                input_position_for_offset(&replaced, next_cursor),
+                window,
+                cx,
+            );
+        });
+        true
+    }
+
+    fn apply_selected_skill_completion_if_open(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(skill_picker) = self.current_skill_picker_state(cx) else {
+            return false;
+        };
+        let Some(selected) = skill_picker.items.get(
+            self.skill_picker_selected_ix
+                .min(skill_picker.items.len().saturating_sub(1)),
+        ) else {
+            return false;
+        };
+        self.apply_skill_completion(&selected.name, window, cx)
+    }
+
+    fn move_skill_picker_selection(&mut self, delta: i32, cx: &mut Context<Self>) -> bool {
+        let Some(skill_picker) = self.current_skill_picker_state(cx) else {
+            return false;
+        };
+        let len = skill_picker.items.len();
+        if len == 0 {
+            return false;
+        }
+
+        let current = self.skill_picker_selected_ix.min(len.saturating_sub(1)) as i32;
+        let next = (current + delta).rem_euclid(len as i32) as usize;
+        if next != self.skill_picker_selected_ix {
+            self.skill_picker_selected_ix = next;
+            self.skill_picker_scroll_handle.scroll_to_item(next);
+            cx.notify();
+        }
+        true
     }
 
     fn relative_time(unix_ts: u64) -> String {
@@ -1255,6 +1689,12 @@ impl AppShell {
     }
 
     fn refresh_selected_thread(&mut self, cx: &mut Context<Self>) {
+        if self.composing_new_thread_cwd.is_some() && self.selected_thread_id.is_none() {
+            self.selected_thread_title = Some("New thread".to_string());
+            self.ensure_skills_for_active_workspace(cx);
+            return;
+        }
+
         let selected =
             Self::preferred_thread(&self.threads, &self.cwd, self.selected_thread_id.as_deref());
 
@@ -1267,6 +1707,7 @@ impl AppShell {
             self.loading_selected_thread = false;
             self.selected_thread_error = None;
             self.streaming_message_ix = None;
+            self.ensure_skills_for_active_workspace(cx);
             return;
         };
 
@@ -1280,6 +1721,7 @@ impl AppShell {
             self.selected_thread_messages.clear();
             self.reset_live_tool_message_state();
             self.selected_thread_error = Some("thread log path is unavailable".to_string());
+            self.ensure_skills_for_active_workspace(cx);
             return;
         };
 
@@ -1295,9 +1737,11 @@ impl AppShell {
                 self.selected_thread_error = Some(format!("failed to load session: {error}"));
             }
         }
+        self.ensure_skills_for_active_workspace(cx);
     }
 
     fn select_thread_by_id(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        self.composing_new_thread_cwd = None;
         self.selected_thread_id = Some(thread_id.to_string());
         self.refresh_selected_thread(cx);
     }
@@ -1310,63 +1754,19 @@ impl AppShell {
     }
 
     fn start_new_thread_in_workspace(&mut self, workspace_cwd: String, cx: &mut Context<Self>) {
-        let Some(server) = self._app_server.clone() else {
-            self.selected_thread_error = Some("Not connected to app-server".to_string());
-            cx.notify();
-            return;
-        };
-
         self.expanded_workspace_groups.insert(workspace_cwd.clone());
         self.selected_thread_error = None;
         self.selected_thread_id = None;
         self.selected_thread_messages.clear();
         self.reset_live_tool_message_state();
+        self.pending_new_thread = false;
+        self.composing_new_thread_cwd = Some(workspace_cwd.clone());
         self.selected_thread_title = Some("New thread".to_string());
         self.selected_thread_loaded_from_api_id = None;
         self.loading_selected_thread = false;
         self.streaming_message_ix = None;
+        self.ensure_skills_for_cwd(workspace_cwd.clone(), cx);
         cx.notify();
-
-        cx.spawn(async move |view, cx| {
-            let response = server
-                .call(
-                    RequestMethod::ThreadStart,
-                    json!({ "cwd": workspace_cwd.clone() }),
-                )
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                match response {
-                    Ok(payload) => {
-                        let id = payload
-                            .get("thread")
-                            .and_then(|thread| thread.get("id"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        if id.is_empty() {
-                            view.selected_thread_error =
-                                Some("thread/start returned no thread id".to_string());
-                            cx.notify();
-                            return;
-                        }
-                        view.selected_thread_id = Some(id);
-                        view.selected_thread_title = Some("New thread".to_string());
-                        view.selected_thread_messages.clear();
-                        view.reset_live_tool_message_state();
-                        view.selected_thread_error = None;
-                        view.selected_thread_loaded_from_api_id = None;
-                        view.loading_selected_thread = false;
-                        view.streaming_message_ix = None;
-                        view.load_threads_from_server(Arc::clone(&server), cx);
-                    }
-                    Err(error) => {
-                        view.selected_thread_error = Some(format!("thread/start failed: {error}"));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     fn clear_workspace_state(&mut self) {
@@ -1383,9 +1783,14 @@ impl AppShell {
         self.selected_thread_error = None;
         self.inflight_threads.clear();
         self.pending_new_thread = false;
+        self.composing_new_thread_cwd = None;
         self.streaming_message_ix = None;
         self.loading_threads = false;
         self.thread_error = None;
+        self.skills_by_cwd.clear();
+        self.loading_skills_cwds.clear();
+        self.active_skills_cwd = self.cwd.clone();
+        self.active_skills.clear();
     }
 
     fn apply_account_read_payload(&mut self, payload: &Value) {
@@ -1479,6 +1884,8 @@ impl AppShell {
                         view.apply_account_read_payload(&payload);
                         if view.is_authenticated && load_threads_if_authenticated {
                             view.load_threads_from_server(Arc::clone(&server), cx);
+                        } else {
+                            view.ensure_skills_for_active_workspace(cx);
                         }
                     }
                     Err(error) => {
@@ -1775,7 +2182,9 @@ impl AppShell {
         };
 
         let thread_id = self.selected_thread_id.clone();
+        let cwd = self.active_composer_cwd();
         if let Some(thread_id) = thread_id.as_deref() {
+            self.composing_new_thread_cwd = None;
             self.inflight_threads.insert(thread_id.to_string());
         } else {
             self.pending_new_thread = true;
@@ -1794,12 +2203,8 @@ impl AppShell {
         self.streaming_message_ix = None;
         cx.notify();
 
-        let cwd = thread_id
-            .as_deref()
-            .and_then(|thread_id| self.threads.iter().find(|thread| thread.id == thread_id))
-            .map(|thread| thread.cwd.clone())
-            .filter(|cwd| !cwd.is_empty())
-            .unwrap_or_else(|| self.cwd.clone());
+        let mut turn_input = vec![json!({ "type": "text", "text": text.clone() })];
+        turn_input.extend(self.skill_input_items_for_text(&text));
 
         cx.spawn(async move |view, cx| {
             let thread_id = if let Some(id) = thread_id {
@@ -1830,10 +2235,12 @@ impl AppShell {
                         let _ = view.update(cx, |view, cx| {
                             view.pending_new_thread = false;
                             view.inflight_threads.insert(id.clone());
+                            view.composing_new_thread_cwd = None;
                             if view.selected_thread_id.is_none() {
                                 view.selected_thread_id = Some(id.clone());
                                 view.selected_thread_title = Some("New thread".to_string());
                             }
+                            view.load_threads_from_server(Arc::clone(&server), cx);
                             cx.notify();
                         });
                         id
@@ -1857,7 +2264,7 @@ impl AppShell {
                     RequestMethod::TurnStart,
                     json!({
                         "threadId": thread_id,
-                        "input": [{ "type": "text", "text": text }],
+                        "input": turn_input,
                         "cwd": cwd,
                         "approvalPolicy": "never",
                     }),
@@ -1896,6 +2303,11 @@ impl Render for AppShell {
         let workspace_groups = Self::group_threads_by_workspace(&self.threads, &self.cwd);
         let this = cx.entity().downgrade();
         let selected_id = self.selected_thread_id.clone();
+        let skill_picker = self.current_skill_picker_state(cx);
+        let skill_picker_selected_ix = skill_picker.as_ref().map(|picker| {
+            self.skill_picker_selected_ix
+                .min(picker.items.len().saturating_sub(1))
+        });
         let can_send = !self.input_state.read(cx).value().trim().is_empty()
             && !self.selected_thread_is_busy()
             && self.is_authenticated
@@ -2324,7 +2736,22 @@ impl Render for AppShell {
                     .child(
                         SidebarGroup::new("Main").child(
                             SidebarMenu::new()
-                                .child(SidebarMenuItem::new("New thread").icon(IconName::Plus))
+                                .child(
+                                    SidebarMenuItem::new("New thread")
+                                        .icon(IconName::Plus)
+                                        .on_click({
+                                            let this = this.clone();
+                                            move |_, _, cx| {
+                                                let _ = this.update(cx, |view, cx| {
+                                                    let workspace_cwd = view.active_composer_cwd();
+                                                    view.start_new_thread_in_workspace(
+                                                        workspace_cwd,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }),
+                                )
                                 .child(SidebarMenuItem::new("Automations").icon(IconName::Bell))
                                 .child(SidebarMenuItem::new("Skills").icon(IconName::BookOpen)),
                         ),
@@ -2767,6 +3194,36 @@ impl Render for AppShell {
                                             .text_color(subtext_color)
                                             .child("Loading thread content...")
                                             .into_any_element()
+                                    } else if let Some(cwd) = &self.composing_new_thread_cwd {
+                                        let workspace_name = Self::workspace_name(cwd);
+                                        div()
+                                            .w_full()
+                                            .min_h(px(460.))
+                                            .flex()
+                                            .flex_col()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap(px(12.))
+                                            .child(
+                                                Icon::new(IconName::Bot)
+                                                    .size(px(44.))
+                                                    .text_color(overlay_color),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xl()
+                                                    .text_color(text_color)
+                                                    .child("New thread"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(subtext_color)
+                                                    .child(format!(
+                                                        "Start your first request in {workspace_name}."
+                                                    )),
+                                            )
+                                            .into_any_element()
                                     } else if self.selected_thread_id.is_some() {
                                         div()
                                             .text_sm()
@@ -2814,19 +3271,193 @@ impl Render for AppShell {
                                     .flex()
                                     .flex_col()
                                     .gap(px(10.))
-                                    .child(
-                                        div().w_full().min_h(px(43.)).child(
-                                            Input::new(&self.input_state)
-                                                .appearance(false)
-                                                .bordered(false)
-                                                .focus_bordered(false)
-                                                .h_full()
-                                                .text_color(text_color)
-                                                .disabled(
-                                                    self.selected_thread_is_busy()
-                                                        || self._app_server.is_none(),
+                                    .when_some(skill_picker.clone(), |this, skill_picker| {
+                                        this.child(
+                                            div()
+                                                .id("skill-picker-scroll")
+                                                .w_full()
+                                                .max_h(px(290.))
+                                                .relative()
+                                                .rounded(px(16.))
+                                                .bg(mantle)
+                                                .border_1()
+                                                .border_color(surface1)
+                                                .overflow_y_scroll()
+                                                .track_scroll(&self.skill_picker_scroll_handle)
+                                                .flex()
+                                                .flex_col()
+                                                .items_stretch()
+                                                .children(
+                                                    skill_picker
+                                                        .items
+                                                        .iter()
+                                                        .enumerate()
+                                                        .map(|(ix, skill)| {
+                                                            let skill_name = skill.name.clone();
+                                                            let display_name = skill_name.clone();
+                                                            let description =
+                                                                skill.description.clone();
+                                                            let scope = if skill.scope.is_empty() {
+                                                                "skill".to_string()
+                                                            } else {
+                                                                skill.scope.clone()
+                                                            };
+                                                            let is_primary =
+                                                                skill_picker_selected_ix
+                                                                    == Some(ix);
+                                                            div()
+                                                                .w_full()
+                                                                .min_w_0()
+                                                                .px(px(12.))
+                                                                .py(px(9.))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_between()
+                                                                .gap(px(12.))
+                                                                .when(is_primary, |this| {
+                                                                    this.bg(surface0)
+                                                                })
+                                                                .hover(|this| this.bg(surface0))
+                                                                .cursor_pointer()
+                                                                .on_mouse_move(cx.listener(
+                                                                    move |view, _, _, cx| {
+                                                                        if view.skill_picker_selected_ix
+                                                                            != ix
+                                                                        {
+                                                                            view.skill_picker_selected_ix =
+                                                                                ix;
+                                                                            cx.notify();
+                                                                        }
+                                                                    },
+                                                                ))
+                                                                .on_mouse_down(
+                                                                    gpui::MouseButton::Left,
+                                                                    cx.listener(
+                                                                        move |view,
+                                                                              _,
+                                                                              window,
+                                                                              cx| {
+                                                                            view.apply_skill_completion(
+                                                                                &skill_name,
+                                                                                window,
+                                                                                cx,
+                                                                            );
+                                                                            cx.notify();
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .gap(px(10.))
+                                                                        .min_w_0()
+                                                                        .flex_1()
+                                                                        .overflow_x_hidden()
+                                                                        .child(
+                                                                            Icon::new(
+                                                                                IconName::BookOpen,
+                                                                            )
+                                                                            .size(px(15.))
+                                                                            .text_color(
+                                                                                overlay_color,
+                                                                            ),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .flex()
+                                                                                .items_center()
+                                                                                .gap(px(10.))
+                                                                                .min_w_0()
+                                                                                .flex_1()
+                                                                                .overflow_x_hidden()
+                                                                                .child(
+                                                                                    div()
+                                                                                        .flex_shrink_0()
+                                                                                        .max_w(px(340.))
+                                                                                        .overflow_hidden()
+                                                                                        .text_ellipsis()
+                                                                                        .whitespace_nowrap()
+                                                                                        .text_sm()
+                                                                                        .font_weight(
+                                                                                            gpui::FontWeight::MEDIUM,
+                                                                                        )
+                                                                                        .text_color(text_color)
+                                                                                        .child(display_name),
+                                                                                )
+                                                                                .child(
+                                                                                    div()
+                                                                                        .flex_1()
+                                                                                        .min_w_0()
+                                                                                        .overflow_hidden()
+                                                                                        .text_ellipsis()
+                                                                                        .whitespace_nowrap()
+                                                                                        .text_sm()
+                                                                                        .text_color(subtext_color)
+                                                                                        .child(description),
+                                                                                ),
+                                                                        ),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .w(px(72.))
+                                                                        .flex_shrink_0()
+                                                                        .text_right()
+                                                                        .text_sm()
+                                                                        .text_color(overlay_color)
+                                                                        .child(scope),
+                                                                )
+                                                        }),
+                                                )
+                                                .vertical_scrollbar(
+                                                    &self.skill_picker_scroll_handle,
                                                 ),
-                                        ),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_h(px(43.))
+                                            .capture_action(cx.listener(
+                                                |view, _: &InputMoveUp, window, cx| {
+                                                    if view.move_skill_picker_selection(-1, cx) {
+                                                        window.prevent_default();
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
+                                            .capture_action(cx.listener(
+                                                |view, _: &InputMoveDown, window, cx| {
+                                                    if view.move_skill_picker_selection(1, cx) {
+                                                        window.prevent_default();
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
+                                            .capture_action(cx.listener(
+                                                |view, action: &InputEnter, window, cx| {
+                                                    if !action.secondary
+                                                        && view.apply_selected_skill_completion_if_open(
+                                                            window, cx,
+                                                        )
+                                                    {
+                                                        window.prevent_default();
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
+                                            .child(
+                                                Input::new(&self.input_state)
+                                                    .appearance(false)
+                                                    .bordered(false)
+                                                    .focus_bordered(false)
+                                                    .h_full()
+                                                    .text_color(text_color)
+                                                    .disabled(
+                                                        self.selected_thread_is_busy()
+                                                            || self._app_server.is_none(),
+                                                    ),
+                                            ),
                                     )
                                     .child(
                                         div()

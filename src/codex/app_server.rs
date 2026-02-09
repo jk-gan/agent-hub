@@ -27,6 +27,8 @@ pub enum RequestMethod {
     ThreadStart,
     #[serde(rename = "thread/resume")]
     ThreadResume,
+    #[serde(rename = "skills/list")]
+    SkillsList,
     #[serde(rename = "turn/start")]
     TurnStart,
 }
@@ -40,6 +42,7 @@ impl RequestMethod {
             Self::ThreadList => "thread/list",
             Self::ThreadStart => "thread/start",
             Self::ThreadResume => "thread/resume",
+            Self::SkillsList => "skills/list",
             Self::TurnStart => "turn/start",
         }
     }
