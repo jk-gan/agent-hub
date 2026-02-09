@@ -114,6 +114,7 @@ impl<'de> Deserialize<'de> for Response {
 
 #[derive(Debug, Clone)]
 pub struct ServerNotification {
+    pub request_id: Option<Value>,
     pub method: String,
     pub params: Value,
 }
@@ -138,10 +139,19 @@ impl IncomingMessage {
         }
 
         let has_method = v.get("method").is_some();
-        if has_method && !has_id {
+        if has_method {
+            let request_id = if has_id && !has_result_or_error {
+                v.get("id").cloned()
+            } else {
+                None
+            };
             let method = v["method"].as_str().unwrap_or_default().to_owned();
             let params = v.get("params").cloned().unwrap_or(Value::Null);
-            return Ok(Self::Notification(ServerNotification { method, params }));
+            return Ok(Self::Notification(ServerNotification {
+                request_id,
+                method,
+                params,
+            }));
         }
 
         Ok(Self::Other)
@@ -254,6 +264,36 @@ impl RawTraceLogger {
         )
     }
 
+    fn log_server_request(
+        &self,
+        thread_id: &str,
+        request_id: &Value,
+        method: &str,
+        raw_json: &str,
+    ) -> Result<(), std::io::Error> {
+        let request_id = request_id_label(request_id);
+        self.append(
+            thread_id,
+            format_args!("SERVER REQUEST id={request_id} method={method}"),
+            raw_json,
+        )
+    }
+
+    fn log_server_response(
+        &self,
+        thread_id: &str,
+        request_id: &Value,
+        method: &str,
+        raw_json: &str,
+    ) -> Result<(), std::io::Error> {
+        let request_id = request_id_label(request_id);
+        self.append(
+            thread_id,
+            format_args!("SERVER RESPONSE id={request_id} method={method}"),
+            raw_json,
+        )
+    }
+
     fn append(
         &self,
         thread_id: &str,
@@ -297,6 +337,14 @@ fn sanitize_thread_id(thread_id: &str) -> String {
         GLOBAL_THREAD_LOG_ID.to_string()
     } else {
         sanitized
+    }
+}
+
+fn request_id_label(request_id: &Value) -> String {
+    match request_id {
+        Value::String(value) => value.clone(),
+        Value::Number(value) => value.to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -471,7 +519,18 @@ impl AppServer {
                     Ok(IncomingMessage::Notification(notification)) => {
                         let thread_log_id = extract_thread_id_from_value(&notification.params)
                             .unwrap_or_else(|| GLOBAL_THREAD_LOG_ID.to_string());
-                        if let Err(error) = trace_logger_for_reader.log_notification(
+                        if let Some(request_id) = notification.request_id.as_ref() {
+                            if let Err(error) = trace_logger_for_reader.log_server_request(
+                                &thread_log_id,
+                                request_id,
+                                &notification.method,
+                                &line,
+                            ) {
+                                eprintln!(
+                                    "app-server: failed to write server request trace: {error}"
+                                );
+                            }
+                        } else if let Err(error) = trace_logger_for_reader.log_notification(
                             &thread_log_id,
                             &notification.method,
                             &line,
@@ -611,6 +670,31 @@ impl AppServer {
         self.event_rx.clone()
     }
 
+    pub async fn respond(
+        &self,
+        request_id: Value,
+        method: &str,
+        thread_id: Option<&str>,
+        result: Value,
+    ) -> Result<(), AppServerError> {
+        let msg = serde_json::json!({
+            "id": request_id.clone(),
+            "result": result,
+        });
+        let line = serde_json::to_string(&msg)?;
+        let thread_log_id = thread_id.unwrap_or(GLOBAL_THREAD_LOG_ID);
+        if let Err(error) =
+            self.trace_logger
+                .log_server_response(thread_log_id, &request_id, method, &line)
+        {
+            eprintln!("app-server: failed to write server response trace: {error}");
+        }
+        self.outgoing_tx
+            .send(line)
+            .await
+            .map_err(|_| AppServerError::Disconnected)
+    }
+
     pub fn notify(&self, method: &str, params: Value) -> Result<(), AppServerError> {
         let msg = serde_json::json!({
             "method": method,
@@ -632,7 +716,7 @@ mod tests {
     use std::fs;
 
     use super::{
-        RawTraceLogger, ResponsePayload, RpcError, extract_thread_id_from_params,
+        IncomingMessage, RawTraceLogger, ResponsePayload, RpcError, extract_thread_id_from_params,
         extract_thread_id_from_payload, extract_thread_id_from_value, sanitize_thread_id,
     };
 
@@ -731,5 +815,55 @@ mod tests {
         assert!(content.contains("NOTIFICATION method=item/agentMessage/delta"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_server_request_as_notification_with_request_id() {
+        let line = serde_json::json!({
+            "id": "0",
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thr-1",
+                "turnId": "1",
+                "itemId": "item-1"
+            }
+        })
+        .to_string();
+
+        let message = IncomingMessage::parse(&line).expect("server request should parse");
+        match message {
+            IncomingMessage::Notification(notification) => {
+                assert_eq!(notification.method, "item/commandExecution/requestApproval");
+                assert_eq!(notification.request_id, Some(serde_json::json!("0")));
+                assert_eq!(
+                    notification
+                        .params
+                        .get("threadId")
+                        .and_then(serde_json::Value::as_str),
+                    Some("thr-1")
+                );
+            }
+            other => panic!("expected notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_regular_notification_without_request_id() {
+        let line = serde_json::json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thr-1"
+            }
+        })
+        .to_string();
+
+        let message = IncomingMessage::parse(&line).expect("notification should parse");
+        match message {
+            IncomingMessage::Notification(notification) => {
+                assert_eq!(notification.method, "turn/started");
+                assert_eq!(notification.request_id, None);
+            }
+            other => panic!("expected notification, got {other:?}"),
+        }
     }
 }

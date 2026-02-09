@@ -312,6 +312,24 @@ enum RenderableMessage {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ApprovalOption {
+    label: String,
+    detail: Option<String>,
+    response_payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PendingApprovalRequest {
+    request_id: Value,
+    method: String,
+    thread_id: Option<String>,
+    title: String,
+    reason: Option<String>,
+    command: Option<String>,
+    options: Vec<ApprovalOption>,
+}
+
 struct AppShell {
     started: bool,
     loading_auth_state: bool,
@@ -349,6 +367,8 @@ struct AppShell {
     active_skills_cwd: String,
     active_skills: Vec<SkillOption>,
     skill_picker_selected_ix: usize,
+    pending_approvals: Vec<PendingApprovalRequest>,
+    approval_selected_ix: usize,
     skill_picker_scroll_handle: ScrollHandle,
     scroll_handle: ScrollHandle,
     input_state: Entity<InputState>,
@@ -432,6 +452,8 @@ impl AppShell {
             active_skills_cwd: cwd.clone(),
             active_skills: Vec::new(),
             skill_picker_selected_ix: 0,
+            pending_approvals: Vec::new(),
+            approval_selected_ix: 0,
             skill_picker_scroll_handle: ScrollHandle::new(),
             scroll_handle: ScrollHandle::new(),
             input_state,
@@ -1753,6 +1775,392 @@ impl AppShell {
         }
     }
 
+    fn has_pending_approval(&self) -> bool {
+        !self.pending_approvals.is_empty()
+    }
+
+    fn set_approval_selection(&mut self, option_ix: usize) -> bool {
+        let Some(approval) = self.pending_approvals.first() else {
+            return false;
+        };
+        if approval.options.is_empty() {
+            return false;
+        }
+        let clamped = option_ix.min(approval.options.len().saturating_sub(1));
+        if self.approval_selected_ix == clamped {
+            return false;
+        }
+        self.approval_selected_ix = clamped;
+        true
+    }
+
+    fn move_approval_selection(&mut self, delta: isize) -> bool {
+        let Some(approval) = self.pending_approvals.first() else {
+            return false;
+        };
+        if approval.options.is_empty() {
+            return false;
+        }
+
+        let len = approval.options.len() as isize;
+        let current = self.approval_selected_ix.min(approval.options.len() - 1) as isize;
+        let mut next = current + delta;
+        if next < 0 {
+            next = len - 1;
+        } else if next >= len {
+            next = 0;
+        }
+        self.approval_selected_ix = next as usize;
+        true
+    }
+
+    fn submit_selected_approval(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(server) = self._app_server.clone() else {
+            self.selected_thread_error = Some("Not connected to app-server".to_string());
+            return false;
+        };
+
+        let Some(approval) = self.pending_approvals.first().cloned() else {
+            return false;
+        };
+
+        if approval.options.is_empty() {
+            return false;
+        }
+
+        let selected_ix = self.approval_selected_ix.min(approval.options.len() - 1);
+        let response_payload = approval.options[selected_ix].response_payload.clone();
+        let request_id = approval.request_id.clone();
+        let method = approval.method.clone();
+        let thread_id = approval.thread_id.clone();
+
+        self.pending_approvals.remove(0);
+        self.approval_selected_ix = 0;
+
+        cx.spawn(async move |view, cx| {
+            let result = server
+                .respond(request_id, &method, thread_id.as_deref(), response_payload)
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if let Err(error) = result {
+                    view.selected_thread_error =
+                        Some(format!("failed to submit approval: {error}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+
+        true
+    }
+
+    fn queue_approval_request(&mut self, notification: &ServerNotification) -> bool {
+        let Some(approval) = Self::pending_approval_from_server_request(notification) else {
+            return false;
+        };
+
+        let already_queued = self
+            .pending_approvals
+            .iter()
+            .any(|pending| pending.request_id == approval.request_id);
+        if already_queued {
+            return false;
+        }
+
+        self.pending_approvals.push(approval);
+        self.approval_selected_ix = 0;
+        true
+    }
+
+    fn pending_approval_from_server_request(
+        notification: &ServerNotification,
+    ) -> Option<PendingApprovalRequest> {
+        let request_id = notification.request_id.clone()?;
+        let thread_id = notification
+            .params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let reason = notification
+            .params
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty());
+
+        match notification.method.as_str() {
+            "item/commandExecution/requestApproval" => {
+                let command = notification
+                    .params
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(Self::simplify_shell_command)
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+
+                let proposed_execpolicy_amendment = notification
+                    .params
+                    .get("proposedExecpolicyAmendment")
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|parts| !parts.is_empty());
+
+                let mut options = vec![ApprovalOption {
+                    label: "Yes".to_string(),
+                    detail: None,
+                    response_payload: json!({ "decision": "accept" }),
+                }];
+
+                if let Some(amendment) = proposed_execpolicy_amendment.clone() {
+                    options.push(ApprovalOption {
+                        label: "Yes, and don't ask again for commands that start with".to_string(),
+                        detail: Some(amendment.join(" ")),
+                        response_payload: json!({
+                            "decision": {
+                                "acceptWithExecpolicyAmendment": {
+                                    "execpolicy_amendment": amendment
+                                }
+                            }
+                        }),
+                    });
+                } else {
+                    options.push(ApprovalOption {
+                        label: "Yes, and don't ask again for this session".to_string(),
+                        detail: command.clone(),
+                        response_payload: json!({ "decision": "acceptForSession" }),
+                    });
+                }
+
+                options.push(ApprovalOption {
+                    label: "No".to_string(),
+                    detail: None,
+                    response_payload: json!({ "decision": "decline" }),
+                });
+
+                Some(PendingApprovalRequest {
+                    request_id,
+                    method: notification.method.clone(),
+                    thread_id,
+                    title: "Do you want to run this command?".to_string(),
+                    reason,
+                    command,
+                    options,
+                })
+            }
+            "item/fileChange/requestApproval" => {
+                let mut options = vec![ApprovalOption {
+                    label: "Yes".to_string(),
+                    detail: None,
+                    response_payload: json!({ "decision": "accept" }),
+                }];
+                options.push(ApprovalOption {
+                    label: "Yes, and don't ask again for this session".to_string(),
+                    detail: None,
+                    response_payload: json!({ "decision": "acceptForSession" }),
+                });
+                options.push(ApprovalOption {
+                    label: "No".to_string(),
+                    detail: None,
+                    response_payload: json!({ "decision": "decline" }),
+                });
+
+                Some(PendingApprovalRequest {
+                    request_id,
+                    method: notification.method.clone(),
+                    thread_id,
+                    title: "Do you want to apply these file changes?".to_string(),
+                    reason,
+                    command: None,
+                    options,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn render_pending_approval_panel(
+        &self,
+        text_color: gpui::Hsla,
+        subtext_color: gpui::Hsla,
+        overlay_color: gpui::Hsla,
+        surface0: gpui::Hsla,
+        surface1: gpui::Hsla,
+        mantle: gpui::Hsla,
+        font_mono: gpui::SharedString,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let approval = self.pending_approvals.first()?.clone();
+        let selected_ix = self
+            .approval_selected_ix
+            .min(approval.options.len().saturating_sub(1));
+        let submit_bg = hsl(220., 12., 8.);
+        let submit_text = hsl(0., 0., 98.);
+
+        Some(
+            div()
+                .w_full()
+                .mb(px(20.))
+                .rounded(px(24.))
+                .border_1()
+                .border_color(surface1)
+                .bg(mantle)
+                .p(px(16.))
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_xl().text_color(text_color).child(approval.title)),
+                )
+                .when_some(approval.command.clone(), |this, command| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .rounded(px(14.))
+                            .bg(surface0)
+                            .px(px(12.))
+                            .py(px(10.))
+                            .font_family(font_mono.clone())
+                            .text_color(subtext_color)
+                            .text_lg()
+                            .child(command),
+                    )
+                })
+                .when_some(approval.reason.clone(), |this, reason| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .text_sm()
+                            .text_color(subtext_color)
+                            .child(reason),
+                    )
+                })
+                .children(
+                    approval
+                        .options
+                        .iter()
+                        .enumerate()
+                        .map(|(option_ix, option)| {
+                            let is_selected = option_ix == selected_ix;
+                            div()
+                                .w_full()
+                                .rounded(px(14.))
+                                .border_1()
+                                .border_color(if is_selected { surface1 } else { mantle })
+                                .bg(if is_selected { surface0 } else { mantle })
+                                .px(px(12.))
+                                .py(px(10.))
+                                .flex()
+                                .items_start()
+                                .justify_between()
+                                .gap(px(10.))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(move |view, _, _, cx| {
+                                        if view.set_approval_selection(option_ix) {
+                                            cx.notify();
+                                        }
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_start()
+                                        .gap(px(10.))
+                                        .child(
+                                            div()
+                                                .text_lg()
+                                                .text_color(overlay_color)
+                                                .child(format!("{}.", option_ix + 1)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(4.))
+                                                .child(
+                                                    div()
+                                                        .text_xl()
+                                                        .text_color(text_color)
+                                                        .child(option.label.clone()),
+                                                )
+                                                .when_some(
+                                                    option.detail.clone(),
+                                                    |this, detail| {
+                                                        this.child(
+                                                            div()
+                                                                .font_family(font_mono.clone())
+                                                                .text_color(subtext_color)
+                                                                .text_lg()
+                                                                .child(detail),
+                                                        )
+                                                    },
+                                                ),
+                                        ),
+                                )
+                                .when(is_selected, |this| {
+                                    this.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(3.))
+                                            .child(
+                                                Icon::new(IconName::ArrowUp)
+                                                    .size(px(14.))
+                                                    .text_color(overlay_color),
+                                            )
+                                            .child(
+                                                Icon::new(IconName::ArrowDown)
+                                                    .size(px(14.))
+                                                    .text_color(overlay_color),
+                                            ),
+                                    )
+                                })
+                        }),
+                )
+                .child(
+                    div().w_full().pt(px(2.)).flex().justify_end().child(
+                        div()
+                            .h(px(46.))
+                            .rounded(px(999.))
+                            .px(px(20.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .bg(submit_bg)
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|view, _, _, cx| {
+                                    if view.submit_selected_approval(cx) {
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child(div().text_xl().text_color(submit_text).child("Submit"))
+                            .child(
+                                Icon::new(IconName::ArrowRight)
+                                    .size(px(16.))
+                                    .text_color(submit_text),
+                            ),
+                    ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn start_new_thread_in_workspace(&mut self, workspace_cwd: String, cx: &mut Context<Self>) {
         self.expanded_workspace_groups.insert(workspace_cwd.clone());
         self.selected_thread_error = None;
@@ -1791,6 +2199,8 @@ impl AppShell {
         self.loading_skills_cwds.clear();
         self.active_skills_cwd = self.cwd.clone();
         self.active_skills.clear();
+        self.pending_approvals.clear();
+        self.approval_selected_ix = 0;
     }
 
     fn apply_account_read_payload(&mut self, payload: &Value) {
@@ -2024,6 +2434,21 @@ impl AppShell {
     }
 
     fn handle_notification(&mut self, notification: &ServerNotification, cx: &mut Context<Self>) {
+        if notification.request_id.is_some() {
+            if matches!(
+                notification.method.as_str(),
+                "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+            ) {
+                self.queue_approval_request(notification);
+            } else {
+                self.selected_thread_error = Some(format!(
+                    "Unsupported server request: {}",
+                    notification.method
+                ));
+            }
+            return;
+        }
+
         let notification_thread_id = notification.params.get("threadId").and_then(Value::as_str);
         let applies_to_selected_thread = match notification_thread_id {
             Some(thread_id) => self.selected_thread_id.as_deref() == Some(thread_id),
@@ -2171,7 +2596,7 @@ impl AppShell {
     fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let text = text.trim().to_string();
-        if text.is_empty() || self.selected_thread_is_busy() {
+        if text.is_empty() || self.selected_thread_is_busy() || self.has_pending_approval() {
             return;
         }
 
@@ -2211,7 +2636,13 @@ impl AppShell {
                 id
             } else {
                 let start_result = server
-                    .call(RequestMethod::ThreadStart, json!({ "cwd": cwd }))
+                    .call(
+                        RequestMethod::ThreadStart,
+                        json!({
+                            "cwd": cwd,
+                            "approvalPolicy": "on-request",
+                        }),
+                    )
                     .await;
                 match start_result {
                     Ok(payload) => {
@@ -2266,7 +2697,7 @@ impl AppShell {
                         "threadId": thread_id,
                         "input": turn_input,
                         "cwd": cwd,
-                        "approvalPolicy": "never",
+                        "approvalPolicy": "on-request",
                     }),
                 )
                 .await;
@@ -2310,6 +2741,7 @@ impl Render for AppShell {
         });
         let can_send = !self.input_state.read(cx).value().trim().is_empty()
             && !self.selected_thread_is_busy()
+            && !self.has_pending_approval()
             && self.is_authenticated
             && self._app_server.is_some();
 
@@ -2696,6 +3128,29 @@ impl Render for AppShell {
             .bg(sidebar_bg)
             .flex()
             .flex_row()
+            .capture_action(cx.listener(|view, _: &InputMoveUp, window, cx| {
+                if view.has_pending_approval() && view.move_approval_selection(-1) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .capture_action(cx.listener(|view, _: &InputMoveDown, window, cx| {
+                if view.has_pending_approval() && view.move_approval_selection(1) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .capture_action(cx.listener(|view, action: &InputEnter, window, cx| {
+                if view.has_pending_approval() && !action.secondary {
+                    if view.submit_selected_approval(cx) {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }
+            }))
             .child(
                 Sidebar::new("sidebar")
                     .w(px(300.))
@@ -2817,15 +3272,29 @@ impl Render for AppShell {
                             .py(px(16.))
                             .child({
                                 div().w_full().flex().justify_center().child(
-                                    div().w_full().max_w(px(920.)).py(px(18.)).child(if !self
-                                        .selected_thread_messages
-                                        .is_empty()
-                                    {
-                                        let chat_rows = self
-                                            .selected_thread_messages
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(message_ix, message)| {
+                                    div()
+                                        .w_full()
+                                        .max_w(px(920.))
+                                        .py(px(18.))
+                                        .when_some(
+                                            self.render_pending_approval_panel(
+                                                text_color,
+                                                subtext_color,
+                                                overlay_color,
+                                                surface0,
+                                                surface1,
+                                                mantle,
+                                                font_mono.clone(),
+                                                cx,
+                                            ),
+                                            |this, panel| this.child(panel),
+                                        )
+                                        .child(if !self.selected_thread_messages.is_empty() {
+                                            let chat_rows = self
+                                                .selected_thread_messages
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(message_ix, message)| {
                                                 match message.speaker {
                                                     ThreadSpeaker::User => div()
                                                         .w_full()
@@ -3180,63 +3649,65 @@ impl Render for AppShell {
                                                     }
                                                 }
                                             })
-                                            .collect::<Vec<_>>();
-                                        div().w_full().children(chat_rows).into_any_element()
-                                    } else if let Some(error) = &self.selected_thread_error {
-                                        div()
-                                            .text_sm()
-                                            .text_color(red_color)
-                                            .child(format!("Unable to render thread: {error}"))
-                                            .into_any_element()
-                                    } else if self.loading_threads || self.loading_selected_thread {
-                                        div()
-                                            .text_sm()
-                                            .text_color(subtext_color)
-                                            .child("Loading thread content...")
-                                            .into_any_element()
-                                    } else if let Some(cwd) = &self.composing_new_thread_cwd {
-                                        let workspace_name = Self::workspace_name(cwd);
-                                        div()
-                                            .w_full()
-                                            .min_h(px(460.))
-                                            .flex()
-                                            .flex_col()
-                                            .items_center()
-                                            .justify_center()
-                                            .gap(px(12.))
-                                            .child(
-                                                Icon::new(IconName::Bot)
-                                                    .size(px(44.))
-                                                    .text_color(overlay_color),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xl()
-                                                    .text_color(text_color)
-                                                    .child("New thread"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(subtext_color)
-                                                    .child(format!(
-                                                        "Start your first request in {workspace_name}."
-                                                    )),
-                                            )
-                                            .into_any_element()
-                                    } else if self.selected_thread_id.is_some() {
-                                        div()
-                                            .text_sm()
-                                            .text_color(subtext_color)
-                                            .child("No messages in this thread yet.")
-                                            .into_any_element()
-                                    } else {
-                                        div()
-                                            .text_sm()
-                                            .text_color(subtext_color)
-                                            .child("Select a thread to view its content.")
-                                            .into_any_element()
-                                    }),
+                                                .collect::<Vec<_>>();
+                                            div().w_full().children(chat_rows).into_any_element()
+                                        } else if let Some(error) = &self.selected_thread_error {
+                                            div()
+                                                .text_sm()
+                                                .text_color(red_color)
+                                                .child(format!("Unable to render thread: {error}"))
+                                                .into_any_element()
+                                        } else if self.loading_threads
+                                            || self.loading_selected_thread
+                                        {
+                                            div()
+                                                .text_sm()
+                                                .text_color(subtext_color)
+                                                .child("Loading thread content...")
+                                                .into_any_element()
+                                        } else if let Some(cwd) = &self.composing_new_thread_cwd {
+                                            let workspace_name = Self::workspace_name(cwd);
+                                            div()
+                                                .w_full()
+                                                .min_h(px(460.))
+                                                .flex()
+                                                .flex_col()
+                                                .items_center()
+                                                .justify_center()
+                                                .gap(px(12.))
+                                                .child(
+                                                    Icon::new(IconName::Bot)
+                                                        .size(px(44.))
+                                                        .text_color(overlay_color),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xl()
+                                                        .text_color(text_color)
+                                                        .child("New thread"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(subtext_color)
+                                                        .child(format!(
+                                                            "Start your first request in {workspace_name}."
+                                                        )),
+                                                )
+                                                .into_any_element()
+                                        } else if self.selected_thread_id.is_some() {
+                                            div()
+                                                .text_sm()
+                                                .text_color(subtext_color)
+                                                .child("No messages in this thread yet.")
+                                                .into_any_element()
+                                        } else {
+                                            div()
+                                                .text_sm()
+                                                .text_color(subtext_color)
+                                                .child("Select a thread to view its content.")
+                                                .into_any_element()
+                                        }),
                                 )
                             }),
                     )
@@ -3455,6 +3926,7 @@ impl Render for AppShell {
                                                     .text_color(text_color)
                                                     .disabled(
                                                         self.selected_thread_is_busy()
+                                                            || self.has_pending_approval()
                                                             || self._app_server.is_none(),
                                                     ),
                                             ),
