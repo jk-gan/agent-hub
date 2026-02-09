@@ -14,3 +14,9 @@ futures-channel = "0.3.31"
 catppuccin = "2.6.0"
 anyhow = "1.0.101"
 rust-embed = "8.11.0"
+
+[package.metadata.bundle]
+name = "Agent Hub"
+identifier = "com.jk-gan.agent-hub"
+icon = ["assets/app-icon@2x.png", "assets/app-icon.png"]
+osx_minimum_system_version = "10.15.7"
