@@ -1155,7 +1155,7 @@ impl AppShell {
                 header: default_header.to_string(),
                 status_label: "Running".to_string(),
                 content: delta.to_string(),
-                expanded: true,
+                expanded: false,
             },
             cx,
         );
@@ -1448,7 +1448,7 @@ impl AppShell {
             header,
             status_label,
             content: body,
-            expanded: true,
+            expanded: false,
         })
     }
 
@@ -1996,169 +1996,212 @@ impl AppShell {
         font_mono: gpui::SharedString,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
+        fn compact_line(text: &str, max_chars: usize) -> String {
+            let normalized = text
+                .split_whitespace()
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut compact = String::new();
+            for (ix, ch) in normalized.chars().enumerate() {
+                if ix >= max_chars {
+                    compact.push_str("...");
+                    break;
+                }
+                compact.push(ch);
+            }
+            compact
+        }
+
         let approval = self.pending_approvals.first()?.clone();
         let selected_ix = self
             .approval_selected_ix
             .min(approval.options.len().saturating_sub(1));
+        let command_preview = approval
+            .command
+            .as_deref()
+            .map(|command| compact_line(command, 120));
+        let reason_preview = approval
+            .reason
+            .as_deref()
+            .map(|reason| compact_line(reason, 120));
+        let queue_hint = if self.pending_approvals.len() > 1 {
+            Some(format!("{} pending", self.pending_approvals.len()))
+        } else {
+            None
+        };
         let submit_bg = hsl(220., 12., 8.);
         let submit_text = hsl(0., 0., 98.);
 
-        Some(
-            div()
+        let mut header_row = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .rounded(px(999.))
+                            .px(px(5.))
+                            .py(px(1.))
+                            .text_xs()
+                            .font_family(font_mono.clone())
+                            .text_color(overlay_color)
+                            .bg(surface0)
+                            .child("APPROVAL"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(text_color)
+                            .child(approval.title),
+                    ),
+            );
+        if let Some(hint) = queue_hint {
+            header_row = header_row.child(
+                div()
+                    .text_xs()
+                    .text_color(overlay_color)
+                    .child(hint),
+            );
+        }
+
+        let option_rows = approval.options.iter().enumerate().map(|(option_ix, option)| {
+            let is_selected = option_ix == selected_ix;
+            let label_preview = compact_line(&option.label, 92);
+
+            let row = div()
                 .w_full()
-                .mb(px(20.))
-                .rounded(px(24.))
+                .rounded(px(8.))
                 .border_1()
-                .border_color(surface1)
-                .bg(mantle)
-                .p(px(16.))
+                .border_color(if is_selected { surface1 } else { surface0 })
+                .bg(if is_selected { surface0 } else { mantle })
+                .px(px(9.))
+                .py(px(6.))
                 .flex()
-                .flex_col()
-                .gap(px(12.))
+                .items_center()
+                .gap(px(6.))
+                .cursor_pointer()
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |view, _, _, cx| {
+                        if view.set_approval_selection(option_ix) {
+                            cx.notify();
+                        }
+                    }),
+                )
                 .child(
                     div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(div().text_xl().text_color(text_color).child(approval.title)),
-                )
-                .when_some(approval.command.clone(), |this, command| {
-                    this.child(
-                        div()
-                            .w_full()
-                            .rounded(px(14.))
-                            .bg(surface0)
-                            .px(px(12.))
-                            .py(px(10.))
-                            .font_family(font_mono.clone())
-                            .text_color(subtext_color)
-                            .text_lg()
-                            .child(command),
-                    )
-                })
-                .when_some(approval.reason.clone(), |this, reason| {
-                    this.child(
-                        div()
-                            .w_full()
-                            .text_sm()
-                            .text_color(subtext_color)
-                            .child(reason),
-                    )
-                })
-                .children(
-                    approval
-                        .options
-                        .iter()
-                        .enumerate()
-                        .map(|(option_ix, option)| {
-                            let is_selected = option_ix == selected_ix;
-                            div()
-                                .w_full()
-                                .rounded(px(14.))
-                                .border_1()
-                                .border_color(if is_selected { surface1 } else { mantle })
-                                .bg(if is_selected { surface0 } else { mantle })
-                                .px(px(12.))
-                                .py(px(10.))
-                                .flex()
-                                .items_start()
-                                .justify_between()
-                                .gap(px(10.))
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(move |view, _, _, cx| {
-                                        if view.set_approval_selection(option_ix) {
-                                            cx.notify();
-                                        }
-                                    }),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_start()
-                                        .gap(px(10.))
-                                        .child(
-                                            div()
-                                                .text_lg()
-                                                .text_color(overlay_color)
-                                                .child(format!("{}.", option_ix + 1)),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .gap(px(4.))
-                                                .child(
-                                                    div()
-                                                        .text_xl()
-                                                        .text_color(text_color)
-                                                        .child(option.label.clone()),
-                                                )
-                                                .when_some(
-                                                    option.detail.clone(),
-                                                    |this, detail| {
-                                                        this.child(
-                                                            div()
-                                                                .font_family(font_mono.clone())
-                                                                .text_color(subtext_color)
-                                                                .text_lg()
-                                                                .child(detail),
-                                                        )
-                                                    },
-                                                ),
-                                        ),
-                                )
-                                .when(is_selected, |this| {
-                                    this.child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(3.))
-                                            .child(
-                                                Icon::new(IconName::ArrowUp)
-                                                    .size(px(14.))
-                                                    .text_color(overlay_color),
-                                            )
-                                            .child(
-                                                Icon::new(IconName::ArrowDown)
-                                                    .size(px(14.))
-                                                    .text_color(overlay_color),
-                                            ),
-                                    )
-                                })
-                        }),
+                        .text_xs()
+                        .font_family(font_mono.clone())
+                        .text_color(overlay_color)
+                        .child(format!("{}.", option_ix + 1)),
                 )
                 .child(
-                    div().w_full().pt(px(2.)).flex().justify_end().child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(text_color)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(label_preview),
+                );
+            row
+        });
+
+        let footer = div()
+            .w_full()
+            .pt(px(1.))
+            .flex()
+            .items_center()
+            .justify_end()
+            .child(
+                div()
+                    .h(px(30.))
+                    .rounded(px(999.))
+                    .px(px(11.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .bg(submit_bg)
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|view, _, _, cx| {
+                            if view.submit_selected_approval(cx) {
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(
                         div()
-                            .h(px(46.))
-                            .rounded(px(999.))
-                            .px(px(20.))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .bg(submit_bg)
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(|view, _, _, cx| {
-                                    if view.submit_selected_approval(cx) {
-                                        cx.notify();
-                                    }
-                                }),
-                            )
-                            .child(div().text_xl().text_color(submit_text).child("Submit"))
-                            .child(
-                                Icon::new(IconName::ArrowRight)
-                                    .size(px(16.))
-                                    .text_color(submit_text),
-                            ),
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(submit_text)
+                            .child("Submit"),
+                    )
+                    .child(
+                        Icon::new(IconName::ArrowRight)
+                            .size(px(12.))
+                            .text_color(submit_text),
                     ),
-                )
-                .into_any_element(),
-        )
+            );
+
+        let mut panel = div()
+            .w_full()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(surface1)
+            .bg(mantle)
+            .px(px(9.))
+            .py(px(8.))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(header_row);
+        if let Some(command) = command_preview {
+            panel = panel.child(
+                div()
+                    .w_full()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(surface1)
+                    .bg(surface0)
+                    .px(px(8.))
+                    .py(px(5.))
+                    .font_family(font_mono.clone())
+                    .text_color(subtext_color)
+                    .text_xs()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(command),
+            );
+        }
+        if let Some(reason) = reason_preview {
+            panel = panel.child(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(subtext_color)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(reason),
+            );
+        }
+        panel = panel.children(option_rows).child(footer);
+
+        Some(panel.into_any_element())
     }
 
     fn start_new_thread_in_workspace(&mut self, workspace_cwd: String, cx: &mut Context<Self>) {
@@ -2488,6 +2531,7 @@ impl AppShell {
                 if !applies_to_selected_thread {
                     return;
                 }
+                self.streaming_message_ix = None;
                 if let Some(item) = notification.params.get("item")
                     && let Some(item_id) = item.get("id").and_then(Value::as_str)
                     && let Some(tool_message) = Self::renderable_message_from_tool_item(item)
@@ -2499,6 +2543,7 @@ impl AppShell {
                 if !applies_to_selected_thread {
                     return;
                 }
+                self.streaming_message_ix = None;
                 if let Some(item_id) = notification.params.get("itemId").and_then(Value::as_str)
                     && let Some(delta) = notification.params.get("delta").and_then(Value::as_str)
                 {
@@ -2509,6 +2554,7 @@ impl AppShell {
                 if !applies_to_selected_thread {
                     return;
                 }
+                self.streaming_message_ix = None;
                 if let Some(item_id) = notification.params.get("itemId").and_then(Value::as_str)
                     && let Some(delta) = notification.params.get("delta").and_then(Value::as_str)
                 {
@@ -2519,6 +2565,7 @@ impl AppShell {
                 if !applies_to_selected_thread {
                     return;
                 }
+                self.streaming_message_ix = None;
                 if let Some(item) = notification.params.get("item")
                     && let Some(tool_message) = Self::renderable_message_from_tool_item(item)
                     && let Some(item_id) = item.get("id").and_then(Value::as_str)
@@ -2744,6 +2791,11 @@ impl Render for AppShell {
             && !self.has_pending_approval()
             && self.is_authenticated
             && self._app_server.is_some();
+        let scroll_offset = self.scroll_handle.offset();
+        let scroll_max = self.scroll_handle.max_offset();
+        let distance_to_bottom = scroll_max.height + scroll_offset.y;
+        let show_scroll_to_bottom =
+            !self.selected_thread_messages.is_empty() && distance_to_bottom > px(8.);
 
         let thread_workspace_items = if self.loading_threads && self.threads.is_empty() {
             vec![
@@ -3263,38 +3315,29 @@ impl Render for AppShell {
                     .child(div().w_full().h(px(1.)).bg(divider_color))
                     .child(
                         div()
-                            .id("chat-scroll")
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll_handle)
-                            .px(px(20.))
-                            .py(px(16.))
-                            .child({
-                                div().w_full().flex().justify_center().child(
-                                    div()
-                                        .w_full()
-                                        .max_w(px(920.))
-                                        .py(px(18.))
-                                        .when_some(
-                                            self.render_pending_approval_panel(
-                                                text_color,
-                                                subtext_color,
-                                                overlay_color,
-                                                surface0,
-                                                surface1,
-                                                mantle,
-                                                font_mono.clone(),
-                                                cx,
-                                            ),
-                                            |this, panel| this.child(panel),
-                                        )
-                                        .child(if !self.selected_thread_messages.is_empty() {
-                                            let chat_rows = self
-                                                .selected_thread_messages
-                                                .iter()
-                                                .enumerate()
-                                                .map(|(message_ix, message)| {
+                            .relative()
+                            .child(
+                                div()
+                                    .id("chat-scroll")
+                                    .size_full()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll_handle)
+                                    .px(px(20.))
+                                    .py(px(16.))
+                                    .child({
+                                        div().w_full().flex().justify_center().child(
+                                            div()
+                                                .w_full()
+                                                .max_w(px(920.))
+                                                .py(px(18.))
+                                                .child(if !self.selected_thread_messages.is_empty() {
+                                                    let chat_rows = self
+                                                        .selected_thread_messages
+                                                        .iter()
+                                                        .enumerate()
+                                                        .map(|(message_ix, message)| {
                                                 match message.speaker {
                                                     ThreadSpeaker::User => div()
                                                         .w_full()
@@ -3648,66 +3691,110 @@ impl Render for AppShell {
                                                         }
                                                     }
                                                 }
-                                            })
-                                                .collect::<Vec<_>>();
-                                            div().w_full().children(chat_rows).into_any_element()
-                                        } else if let Some(error) = &self.selected_thread_error {
+                                                })
+                                                    .collect::<Vec<_>>();
+                                                    div().w_full().children(chat_rows).into_any_element()
+                                                } else if let Some(error) = &self.selected_thread_error {
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(red_color)
+                                                        .child(format!("Unable to render thread: {error}"))
+                                                        .into_any_element()
+                                                } else if self.loading_threads
+                                                    || self.loading_selected_thread
+                                                {
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(subtext_color)
+                                                        .child("Loading thread content...")
+                                                        .into_any_element()
+                                                } else if let Some(cwd) = &self.composing_new_thread_cwd {
+                                                    let workspace_name = Self::workspace_name(cwd);
+                                                    div()
+                                                        .w_full()
+                                                        .min_h(px(460.))
+                                                        .flex()
+                                                        .flex_col()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .gap(px(12.))
+                                                        .child(
+                                                            Icon::new(IconName::Bot)
+                                                                .size(px(44.))
+                                                                .text_color(overlay_color),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xl()
+                                                                .text_color(text_color)
+                                                                .child("New thread"),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_sm()
+                                                                .text_color(subtext_color)
+                                                                .child(format!(
+                                                                    "Start your first request in {workspace_name}."
+                                                                )),
+                                                        )
+                                                        .into_any_element()
+                                                } else if self.selected_thread_id.is_some() {
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(subtext_color)
+                                                        .child("No messages in this thread yet.")
+                                                        .into_any_element()
+                                                } else {
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(subtext_color)
+                                                        .child("Select a thread to view its content.")
+                                                        .into_any_element()
+                                                })
+                                        )
+                                    }),
+                            )
+                            .when(show_scroll_to_bottom, |this| {
+                                this.child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .right_0()
+                                        .bottom(px(5.))
+                                        .flex()
+                                        .justify_center()
+                                        .child(
                                             div()
-                                                .text_sm()
-                                                .text_color(red_color)
-                                                .child(format!("Unable to render thread: {error}"))
-                                                .into_any_element()
-                                        } else if self.loading_threads
-                                            || self.loading_selected_thread
-                                        {
-                                            div()
-                                                .text_sm()
-                                                .text_color(subtext_color)
-                                                .child("Loading thread content...")
-                                                .into_any_element()
-                                        } else if let Some(cwd) = &self.composing_new_thread_cwd {
-                                            let workspace_name = Self::workspace_name(cwd);
-                                            div()
-                                                .w_full()
-                                                .min_h(px(460.))
+                                                .id("scroll-to-bottom")
+                                                .h(px(36.))
+                                                .px(px(12.))
+                                                .rounded(px(999.))
+                                                .border_1()
+                                                .border_color(surface1)
+                                                .bg(mantle)
+                                                .cursor_pointer()
                                                 .flex()
-                                                .flex_col()
                                                 .items_center()
-                                                .justify_center()
-                                                .gap(px(12.))
+                                                .gap(px(6.))
+                                                .on_mouse_down(
+                                                    gpui::MouseButton::Left,
+                                                    cx.listener(|view, _, _, cx| {
+                                                        view.scroll_handle.scroll_to_bottom();
+                                                        cx.notify();
+                                                    }),
+                                                )
                                                 .child(
-                                                    Icon::new(IconName::Bot)
-                                                        .size(px(44.))
+                                                    Icon::new(IconName::ArrowDown)
+                                                        .size(px(14.))
                                                         .text_color(overlay_color),
                                                 )
                                                 .child(
                                                     div()
-                                                        .text_xl()
-                                                        .text_color(text_color)
-                                                        .child("New thread"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(subtext_color)
-                                                        .child(format!(
-                                                            "Start your first request in {workspace_name}."
-                                                        )),
-                                                )
-                                                .into_any_element()
-                                        } else if self.selected_thread_id.is_some() {
-                                            div()
-                                                .text_sm()
-                                                .text_color(subtext_color)
-                                                .child("No messages in this thread yet.")
-                                                .into_any_element()
-                                        } else {
-                                            div()
-                                                .text_sm()
-                                                .text_color(subtext_color)
-                                                .child("Select a thread to view its content.")
-                                                .into_any_element()
-                                        }),
+                                                        .text_xs()
+                                                        .text_color(overlay_color)
+                                                        .child("Bottom"),
+                                                ),
+                                        ),
                                 )
                             }),
                     )
@@ -3742,6 +3829,19 @@ impl Render for AppShell {
                                     .flex()
                                     .flex_col()
                                     .gap(px(10.))
+                                    .when_some(
+                                        self.render_pending_approval_panel(
+                                            text_color,
+                                            subtext_color,
+                                            overlay_color,
+                                            surface0,
+                                            surface1,
+                                            mantle,
+                                            font_mono.clone(),
+                                            cx,
+                                        ),
+                                        |this, panel| this.child(panel),
+                                    )
                                     .when_some(skill_picker.clone(), |this, skill_picker| {
                                         this.child(
                                             div()
@@ -4082,7 +4182,10 @@ fn main() {
 
         cx.on_action(|_: &Quit, cx| cx.quit());
 
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("shift-enter", InputEnter { secondary: true }, Some("Input")),
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
         cx.set_menus(app_menus());
         cx.activate(true);
     });
@@ -4115,7 +4218,7 @@ mod tests {
             } => {
                 assert_eq!(header, "Ran command for 52ms");
                 assert_eq!(status_label, "Success");
-                assert!(expanded);
+                assert!(!expanded);
                 assert!(content.contains("```bash"));
                 assert!(content.contains("$ ls -1"));
                 assert!(content.contains("Cargo.toml"));
@@ -4251,7 +4354,7 @@ mod tests {
         ));
         assert!(matches!(
             &messages[1],
-            RenderableMessage::CommandExecution { .. }
+            RenderableMessage::CommandExecution { expanded, .. } if !expanded
         ));
         assert!(matches!(
             &messages[2],
