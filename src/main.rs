@@ -420,6 +420,7 @@ struct AppShell {
     account_plan_type: Option<String>,
     auth_error: Option<String>,
     login_in_progress: bool,
+    logout_in_progress: bool,
     pending_login_id: Option<String>,
     login_url: Option<String>,
     loading_threads: bool,
@@ -533,6 +534,7 @@ impl AppShell {
             account_plan_type: None,
             auth_error: None,
             login_in_progress: false,
+            logout_in_progress: false,
             pending_login_id: None,
             login_url: None,
             loading_threads: false,
@@ -3164,6 +3166,45 @@ impl AppShell {
         .detach();
     }
 
+    fn start_logout(&mut self, cx: &mut Context<Self>) {
+        if self.logout_in_progress {
+            return;
+        }
+
+        let Some(server) = self._app_server.clone() else {
+            self.auth_error = Some("Not connected to app-server".to_string());
+            cx.notify();
+            return;
+        };
+
+        self.logout_in_progress = true;
+        self.auth_error = None;
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let response = server.call(RequestMethod::AccountLogout, json!({})).await;
+            let _ = view.update(cx, |view, cx| {
+                view.logout_in_progress = false;
+                match response {
+                    Ok(_) => {
+                        view.login_url = None;
+                        view.pending_login_id = None;
+                        view.login_in_progress = false;
+                        view.auth_error = None;
+                        if let Some(server) = view._app_server.clone() {
+                            view.refresh_account_state(server, false, cx);
+                        }
+                    }
+                    Err(error) => {
+                        view.auth_error = Some(format!("account/logout failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn open_auth_url(url: &str) {
         #[cfg(target_os = "macos")]
         let _ = Command::new("open").arg(url).spawn();
@@ -3377,6 +3418,7 @@ impl AppShell {
                 }
             }
             "account/updated" => {
+                self.logout_in_progress = false;
                 let auth_mode = notification.params.get("authMode").and_then(Value::as_str);
                 if auth_mode.is_none() {
                     self.is_authenticated = false;
@@ -4169,15 +4211,47 @@ impl Render for AppShell {
                             .child(SidebarMenu::new().children(thread_workspace_items)),
                     )
                     .footer(
-                        SidebarFooter::new().child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(Icon::new(IconName::Settings))
-                                .when(!self.sidebar_collapsed, |this| this.child("Settings")),
-                        ),
+                        SidebarFooter::new()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .child(Icon::new(IconName::Settings))
+                                            .when(!self.sidebar_collapsed, |this| {
+                                                this.child("Settings")
+                                            }),
+                                    )
+                                    .when(!self.sidebar_collapsed, |this| {
+                                        this.child(Icon::new(IconName::ChevronUp).size(px(14.)))
+                                    }),
+                            )
+                            .dropdown_menu_with_anchor(gpui::Corner::TopLeft, {
+                                let this = this.clone();
+                                let logout_in_progress = self.logout_in_progress;
+                                move |menu: PopupMenu,
+                                      _window: &mut Window,
+                                      _cx: &mut gpui::Context<PopupMenu>| {
+                                    if logout_in_progress {
+                                        return menu.label("Logging out...");
+                                    }
+
+                                    menu.item(PopupMenuItem::new("Logout").on_click({
+                                        let this = this.clone();
+                                        move |_, _, cx| {
+                                            let _ = this.update(cx, |view, cx| {
+                                                view.start_logout(cx);
+                                            });
+                                        }
+                                    }))
+                                }
+                            }),
                     ),
             )
             .child(div().w(px(1.)).h_full().bg(divider_color))
