@@ -19,8 +19,12 @@ pub enum RequestMethod {
     Initialize,
     #[serde(rename = "account/read")]
     AccountRead,
+    #[serde(rename = "config/read")]
+    ConfigRead,
     #[serde(rename = "account/login/start")]
     AccountLoginStart,
+    #[serde(rename = "model/list")]
+    ModelList,
     #[serde(rename = "thread/list")]
     ThreadList,
     #[serde(rename = "thread/start")]
@@ -38,7 +42,9 @@ impl RequestMethod {
         match self {
             Self::Initialize => "initialize",
             Self::AccountRead => "account/read",
+            Self::ConfigRead => "config/read",
             Self::AccountLoginStart => "account/login/start",
+            Self::ModelList => "model/list",
             Self::ThreadList => "thread/list",
             Self::ThreadStart => "thread/start",
             Self::ThreadResume => "thread/resume",

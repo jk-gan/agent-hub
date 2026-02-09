@@ -15,20 +15,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use codex::app_server::{AppServer, AppServerError, RequestMethod, ServerNotification};
 use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Context, Entity, KeyBinding, Menu, MenuItem, Render, ScrollHandle,
-    Subscription, Window, WindowBounds, WindowOptions, actions, div, px, size,
+    App, Application, Bounds, ClipboardEntry, Context, Entity, ExternalPaths, ImageFormat,
+    KeyBinding, Menu, MenuItem, Render, ScrollHandle, Subscription, Window, WindowBounds,
+    WindowOptions, actions, div, img, px, size,
 };
 use gpui_component::Root;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::highlighter::HighlightTheme;
 use gpui_component::input::{
     Enter as InputEnter, Input, InputEvent, InputState, MoveDown as InputMoveDown,
-    MoveUp as InputMoveUp, Position,
+    MoveUp as InputMoveUp, Paste as InputPaste, Position,
 };
+use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::theme::{Theme as ComponentTheme, hsl};
-use gpui_component::{Icon, IconName, Sizable as _};
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_component_assets::Assets;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -136,6 +138,42 @@ const fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelListResponse {
+    #[serde(default)]
+    data: Vec<ModelListItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelListItem {
+    model: String,
+    display_name: String,
+    #[serde(default)]
+    supported_reasoning_efforts: Vec<ModelReasoningEffortItem>,
+    default_reasoning_effort: Option<String>,
+    #[serde(default)]
+    is_default: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelReasoningEffortItem {
+    reasoning_effort: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConfigReadResponse {
+    config: ConfigReadConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConfigReadConfig {
+    model: Option<String>,
+    model_reasoning_effort: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct SkillOption {
     name: String,
@@ -145,8 +183,22 @@ struct SkillOption {
 }
 
 #[derive(Debug, Clone)]
+struct ModelOption {
+    model: String,
+    display_name: String,
+    supported_reasoning_efforts: Vec<String>,
+    default_reasoning_effort: Option<String>,
+    is_default: bool,
+}
+
+#[derive(Debug, Clone)]
 struct SkillPickerState {
     items: Vec<SkillOption>,
+}
+
+#[derive(Debug, Clone)]
+struct FilePickerState {
+    items: Vec<String>,
 }
 
 fn is_skill_name_char(ch: char) -> bool {
@@ -222,6 +274,28 @@ fn extract_skill_mentions(text: &str) -> Vec<String> {
     mentions
 }
 
+fn is_file_trigger_prefix_char(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '(' | '[' | '{')
+}
+
+fn file_token_before_cursor(prefix: &str) -> Option<(usize, String)> {
+    let at_ix = prefix.rfind('@')?;
+
+    if at_ix > 0
+        && let Some((_, prev_char)) = prefix[..at_ix].char_indices().next_back()
+        && !is_file_trigger_prefix_char(prev_char)
+    {
+        return None;
+    }
+
+    let query = &prefix[(at_ix + 1)..];
+    if query.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    Some((at_ix, query.to_string()))
+}
+
 fn input_position_for_offset(text: &str, offset: usize) -> Position {
     let clamped_offset = offset.min(text.len());
     let mut line = 0u32;
@@ -289,6 +363,7 @@ enum ThreadMessageKind {
 struct ThreadMessage {
     speaker: ThreadSpeaker,
     content: String,
+    image_refs: Vec<String>,
     view_state: Entity<TextViewState>,
     kind: ThreadMessageKind,
 }
@@ -298,6 +373,7 @@ enum RenderableMessage {
     Text {
         speaker: ThreadSpeaker,
         content: String,
+        image_refs: Vec<String>,
     },
     CommandExecution {
         header: String,
@@ -310,6 +386,12 @@ enum RenderableMessage {
         file_diffs: Vec<diff_view::ParsedFileDiff>,
         expanded: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct UserMessageContent {
+    text: String,
+    image_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -366,10 +448,21 @@ struct AppShell {
     loading_skills_cwds: HashSet<String>,
     active_skills_cwd: String,
     active_skills: Vec<SkillOption>,
+    files_by_cwd: HashMap<String, Vec<String>>,
+    loading_files_cwds: HashSet<String>,
+    active_files_cwd: String,
+    active_files: Vec<String>,
+    available_models: Vec<ModelOption>,
+    loading_model_options: bool,
+    selected_model: Option<String>,
+    selected_reasoning_effort: Option<String>,
     skill_picker_selected_ix: usize,
+    file_picker_selected_ix: usize,
     pending_approvals: Vec<PendingApprovalRequest>,
     approval_selected_ix: usize,
+    attached_images: Vec<PathBuf>,
     skill_picker_scroll_handle: ScrollHandle,
+    file_picker_scroll_handle: ScrollHandle,
     scroll_handle: ScrollHandle,
     input_state: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -379,6 +472,21 @@ struct AppShell {
 impl AppShell {
     const MAX_THREADS_PER_WORKSPACE: usize = 10;
     const MAX_RENDERED_THREAD_CHARS: usize = 80_000;
+    const MAX_FILE_OPTIONS_PER_WORKSPACE: usize = 20_000;
+    const MAX_FILE_PICKER_ITEMS: usize = 500;
+    const SKIPPED_FILE_PICKER_DIRS: [&'static str; 11] = [
+        ".git",
+        ".next",
+        ".turbo",
+        ".cache",
+        ".idea",
+        ".zed",
+        ".vscode",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+    ];
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let cwd = Self::current_cwd();
@@ -404,9 +512,11 @@ impl AppShell {
                 InputEvent::Change => {
                     this.skill_picker_selected_ix = 0;
                     this.skill_picker_scroll_handle.scroll_to_item(0);
+                    this.file_picker_selected_ix = 0;
+                    this.file_picker_scroll_handle.scroll_to_item(0);
                 }
                 InputEvent::PressEnter { secondary } if !*secondary => {
-                    if this.apply_selected_skill_completion_if_open(window, cx) {
+                    if this.apply_selected_completion_if_open(window, cx) {
                         return;
                     }
                     this.send_message(window, cx);
@@ -451,10 +561,21 @@ impl AppShell {
             loading_skills_cwds: HashSet::new(),
             active_skills_cwd: cwd.clone(),
             active_skills: Vec::new(),
+            files_by_cwd: HashMap::new(),
+            loading_files_cwds: HashSet::new(),
+            active_files_cwd: cwd.clone(),
+            active_files: Vec::new(),
+            available_models: Vec::new(),
+            loading_model_options: false,
+            selected_model: None,
+            selected_reasoning_effort: None,
             skill_picker_selected_ix: 0,
+            file_picker_selected_ix: 0,
             pending_approvals: Vec::new(),
             approval_selected_ix: 0,
+            attached_images: Vec::new(),
             skill_picker_scroll_handle: ScrollHandle::new(),
+            file_picker_scroll_handle: ScrollHandle::new(),
             scroll_handle: ScrollHandle::new(),
             input_state,
             _subscriptions,
@@ -532,6 +653,304 @@ impl AppShell {
             .map(|thread| thread.cwd.clone())
             .filter(|cwd| !cwd.is_empty())
             .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    fn parse_model_options(payload: Value) -> Result<Vec<ModelOption>, String> {
+        let response: ModelListResponse = serde_json::from_value(payload)
+            .map_err(|error| format!("invalid response: {error}"))?;
+
+        let mut options = response
+            .data
+            .into_iter()
+            .filter_map(|item| {
+                let model = item.model.trim();
+                if model.is_empty() {
+                    return None;
+                }
+
+                let display_name = if item.display_name.trim().is_empty() {
+                    model.to_string()
+                } else {
+                    item.display_name
+                };
+                let supported_reasoning_efforts = item
+                    .supported_reasoning_efforts
+                    .into_iter()
+                    .map(|effort| effort.reasoning_effort)
+                    .filter(|effort| !effort.trim().is_empty())
+                    .collect::<Vec<_>>();
+
+                Some(ModelOption {
+                    model: model.to_string(),
+                    display_name: display_name.trim().to_string(),
+                    supported_reasoning_efforts,
+                    default_reasoning_effort: item.default_reasoning_effort,
+                    is_default: item.is_default,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        options.sort_by_key(|option| (!option.is_default, option.display_name.to_lowercase()));
+        Ok(options)
+    }
+
+    fn parse_config_read(payload: Value) -> Result<ConfigReadConfig, String> {
+        let response: ConfigReadResponse = serde_json::from_value(payload)
+            .map_err(|error| format!("invalid response: {error}"))?;
+        Ok(response.config)
+    }
+
+    fn selected_model_option(&self) -> Option<&ModelOption> {
+        self.selected_model.as_deref().and_then(|selected| {
+            self.available_models
+                .iter()
+                .find(|option| option.model == selected)
+        })
+    }
+
+    fn available_reasoning_efforts(&self) -> Vec<String> {
+        self.selected_model_option()
+            .map(|option| option.supported_reasoning_efforts.clone())
+            .unwrap_or_default()
+    }
+
+    fn normalize_selected_reasoning_effort(&mut self) {
+        let reasoning_efforts = self.available_reasoning_efforts();
+        if reasoning_efforts.is_empty() {
+            self.selected_reasoning_effort = None;
+            return;
+        }
+
+        if let Some(selected) = self.selected_reasoning_effort.as_deref()
+            && reasoning_efforts.iter().any(|effort| effort == selected)
+        {
+            return;
+        }
+
+        if let Some(default_effort) = self
+            .selected_model_option()
+            .and_then(|option| option.default_reasoning_effort.as_deref())
+            .filter(|effort| {
+                reasoning_efforts
+                    .iter()
+                    .any(|candidate| candidate == *effort)
+            })
+        {
+            self.selected_reasoning_effort = Some(default_effort.to_string());
+            return;
+        }
+
+        self.selected_reasoning_effort = reasoning_efforts.first().cloned();
+    }
+
+    fn apply_model_config(
+        &mut self,
+        available_models: Vec<ModelOption>,
+        config_model: Option<String>,
+        config_reasoning_effort: Option<String>,
+    ) {
+        let previous_model = self.selected_model.clone();
+        self.available_models = available_models;
+
+        if self.available_models.is_empty() {
+            self.selected_model = None;
+            self.selected_reasoning_effort = None;
+            return;
+        }
+
+        let next_model = previous_model
+            .filter(|model| {
+                self.available_models
+                    .iter()
+                    .any(|option| &option.model == model)
+            })
+            .or(config_model.filter(|model| {
+                self.available_models
+                    .iter()
+                    .any(|option| option.model == model.as_str())
+            }))
+            .or_else(|| {
+                self.available_models
+                    .iter()
+                    .find(|option| option.is_default)
+                    .map(|option| option.model.clone())
+            })
+            .or_else(|| {
+                self.available_models
+                    .first()
+                    .map(|option| option.model.clone())
+            });
+
+        self.selected_model = next_model;
+
+        let reasoning_efforts = self.available_reasoning_efforts();
+        self.selected_reasoning_effort = config_reasoning_effort.filter(|effort| {
+            reasoning_efforts
+                .iter()
+                .any(|candidate| candidate == effort)
+        });
+        self.normalize_selected_reasoning_effort();
+    }
+
+    fn load_model_and_reasoning_options(&mut self, server: Arc<AppServer>, cx: &mut Context<Self>) {
+        if self.loading_model_options {
+            return;
+        }
+
+        self.loading_model_options = true;
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let model_list = server.call(RequestMethod::ModelList, json!({})).await;
+            let config_read = server.call(RequestMethod::ConfigRead, json!({})).await;
+
+            let _ = view.update(cx, |view, cx| {
+                view.loading_model_options = false;
+
+                if let (Ok(model_payload), Ok(config_payload)) = (model_list, config_read)
+                    && let (Ok(models), Ok(config)) = (
+                        Self::parse_model_options(model_payload),
+                        Self::parse_config_read(config_payload),
+                    )
+                {
+                    view.apply_model_config(models, config.model, config.model_reasoning_effort);
+                }
+
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn selected_model_label(&self) -> String {
+        if self.loading_model_options && self.available_models.is_empty() {
+            return "Loading model...".to_string();
+        }
+
+        self.selected_model_option()
+            .map(|option| option.display_name.clone())
+            .unwrap_or_else(|| "Model".to_string())
+    }
+
+    fn selected_reasoning_label(&self) -> String {
+        if self.loading_model_options && self.available_models.is_empty() {
+            return "Loading reasoning...".to_string();
+        }
+
+        self.selected_reasoning_effort
+            .as_deref()
+            .map(Self::format_reasoning_effort_label)
+            .unwrap_or_else(|| "Reasoning".to_string())
+    }
+
+    fn format_reasoning_effort_label(effort: &str) -> String {
+        match effort {
+            "xhigh" => "X-High".to_string(),
+            "high" => "High".to_string(),
+            "medium" => "Medium".to_string(),
+            "low" => "Low".to_string(),
+            other => {
+                let mut chars = other.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let mut result = first.to_uppercase().to_string();
+                        result.push_str(chars.as_str());
+                        result
+                    }
+                    None => "Reasoning".to_string(),
+                }
+            }
+        }
+    }
+
+    fn should_skip_file_picker_dir(name: &str) -> bool {
+        Self::SKIPPED_FILE_PICKER_DIRS.contains(&name)
+    }
+
+    fn collect_workspace_files(cwd: &str, max_files: usize) -> Vec<String> {
+        let root = PathBuf::from(cwd);
+        let Ok(metadata) = fs::metadata(&root) else {
+            return Vec::new();
+        };
+        if !metadata.is_dir() {
+            return Vec::new();
+        }
+
+        if let Ok(output) = Command::new("rg")
+            .arg("--files")
+            .current_dir(&root)
+            .output()
+            && output.status.success()
+        {
+            let mut files = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| line.replace('\\', "/"))
+                .take(max_files)
+                .collect::<Vec<_>>();
+            files.sort_unstable_by_key(|path| path.to_ascii_lowercase());
+            files.dedup();
+            return files;
+        }
+
+        let mut files = Vec::new();
+        let mut stack = vec![root.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let read_dir = match fs::read_dir(&dir) {
+                Ok(read_dir) => read_dir,
+                Err(_) => continue,
+            };
+
+            for entry_result in read_dir {
+                if files.len() >= max_files {
+                    break;
+                }
+
+                let Ok(entry) = entry_result else {
+                    continue;
+                };
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+
+                if file_type.is_symlink() {
+                    continue;
+                }
+
+                let path = entry.path();
+                if file_type.is_dir() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if Self::should_skip_file_picker_dir(name.as_ref()) {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+
+                if !file_type.is_file() {
+                    continue;
+                }
+
+                let Ok(relative) = path.strip_prefix(&root) else {
+                    continue;
+                };
+                if relative.as_os_str().is_empty() {
+                    continue;
+                }
+                files.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+
+            if files.len() >= max_files {
+                break;
+            }
+        }
+
+        files.sort_unstable_by_key(|path| path.to_ascii_lowercase());
+        files.dedup();
+        files
     }
 
     fn set_active_skills_for_cwd(&mut self, cwd: &str) {
@@ -625,6 +1044,50 @@ impl AppShell {
         self.ensure_skills_for_cwd(cwd, cx);
     }
 
+    fn set_active_files_for_cwd(&mut self, cwd: &str) {
+        self.active_files_cwd = cwd.to_string();
+        self.active_files = self.files_by_cwd.get(cwd).cloned().unwrap_or_default();
+    }
+
+    fn ensure_files_for_cwd(&mut self, cwd: String, cx: &mut Context<Self>) {
+        if self.active_files_cwd != cwd {
+            self.set_active_files_for_cwd(&cwd);
+        }
+
+        if self.files_by_cwd.contains_key(&cwd) || self.loading_files_cwds.contains(&cwd) {
+            return;
+        }
+
+        self.loading_files_cwds.insert(cwd.clone());
+        cx.spawn(async move |view, cx| {
+            let files = Self::collect_workspace_files(&cwd, Self::MAX_FILE_OPTIONS_PER_WORKSPACE);
+
+            let _ = view.update(cx, |view, _cx| {
+                view.loading_files_cwds.remove(&cwd);
+                view.files_by_cwd.insert(cwd.clone(), files.clone());
+                if view.active_files_cwd == cwd {
+                    view.active_files = files;
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn ensure_files_for_active_workspace(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.active_composer_cwd();
+        self.ensure_files_for_cwd(cwd, cx);
+    }
+
+    fn ensure_composer_options_for_cwd(&mut self, cwd: String, cx: &mut Context<Self>) {
+        self.ensure_skills_for_cwd(cwd.clone(), cx);
+        self.ensure_files_for_cwd(cwd, cx);
+    }
+
+    fn ensure_composer_options_for_active_workspace(&mut self, cx: &mut Context<Self>) {
+        self.ensure_skills_for_active_workspace(cx);
+        self.ensure_files_for_active_workspace(cx);
+    }
+
     fn skill_input_items_for_text(&self, text: &str) -> Vec<Value> {
         let first_skill_by_name = self
             .active_skills
@@ -694,6 +1157,59 @@ impl AppShell {
         }
 
         Some(SkillPickerState { items })
+    }
+
+    fn current_file_picker_state(&self, cx: &App) -> Option<FilePickerState> {
+        let (text, cursor) = {
+            let input = self.input_state.read(cx);
+            (input.value().to_string(), input.cursor())
+        };
+
+        let prefix = text.get(..cursor)?;
+        let (_, query) = file_token_before_cursor(prefix)?;
+        let query_lower = query.to_ascii_lowercase();
+
+        let mut filtered = self
+            .active_files
+            .iter()
+            .cloned()
+            .filter_map(|path| {
+                if query_lower.is_empty() {
+                    return Some((0u8, path));
+                }
+
+                let path_lower = path.to_ascii_lowercase();
+                let file_name_lower = path_lower.rsplit('/').next().unwrap_or(path_lower.as_str());
+                if file_name_lower.starts_with(&query_lower) {
+                    return Some((0u8, path));
+                }
+                if path_lower.starts_with(&query_lower) {
+                    return Some((1u8, path));
+                }
+                if path_lower.contains(&query_lower) {
+                    return Some((2u8, path));
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+
+        filtered.sort_by(|(score_a, path_a), (score_b, path_b)| {
+            score_a
+                .cmp(score_b)
+                .then_with(|| path_a.len().cmp(&path_b.len()))
+                .then_with(|| path_a.cmp(path_b))
+        });
+
+        let items = filtered
+            .into_iter()
+            .map(|(_, path)| path)
+            .take(Self::MAX_FILE_PICKER_ITEMS)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            return None;
+        }
+
+        Some(FilePickerState { items })
     }
 
     fn apply_skill_completion(
@@ -781,6 +1297,118 @@ impl AppShell {
             cx.notify();
         }
         true
+    }
+
+    fn apply_file_completion(
+        &mut self,
+        file_path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (text, cursor) = {
+            let input = self.input_state.read(cx);
+            (input.value().to_string(), input.cursor())
+        };
+
+        let Some(prefix) = text.get(..cursor) else {
+            return false;
+        };
+        let Some((at_ix, _query)) = file_token_before_cursor(prefix) else {
+            return false;
+        };
+
+        if at_ix > cursor || cursor > text.len() {
+            return false;
+        }
+
+        let mut token_end = cursor;
+        while token_end < text.len() {
+            let Some(next_char) = text[token_end..].chars().next() else {
+                break;
+            };
+            if next_char.is_whitespace() {
+                break;
+            }
+            token_end += next_char.len_utf8();
+        }
+
+        let before = &text[..at_ix];
+        let after = &text[token_end..];
+        let trailing_space = if after
+            .chars()
+            .next()
+            .is_none_or(|next_char| !next_char.is_whitespace())
+        {
+            " "
+        } else {
+            ""
+        };
+        let replaced = format!("{before}{file_path}{trailing_space}{after}");
+        let next_cursor = before.len() + file_path.len() + trailing_space.len();
+
+        self.input_state.update(cx, move |state, cx| {
+            state.set_value(replaced.clone(), window, cx);
+            state.set_cursor_position(
+                input_position_for_offset(&replaced, next_cursor),
+                window,
+                cx,
+            );
+        });
+        true
+    }
+
+    fn apply_selected_file_completion_if_open(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(file_picker) = self.current_file_picker_state(cx) else {
+            return false;
+        };
+        let Some(selected) = file_picker.items.get(
+            self.file_picker_selected_ix
+                .min(file_picker.items.len().saturating_sub(1)),
+        ) else {
+            return false;
+        };
+        self.apply_file_completion(selected, window, cx)
+    }
+
+    fn move_file_picker_selection(&mut self, delta: i32, cx: &mut Context<Self>) -> bool {
+        let Some(file_picker) = self.current_file_picker_state(cx) else {
+            return false;
+        };
+        let len = file_picker.items.len();
+        if len == 0 {
+            return false;
+        }
+
+        let current = self.file_picker_selected_ix.min(len.saturating_sub(1)) as i32;
+        let next = (current + delta).rem_euclid(len as i32) as usize;
+        if next != self.file_picker_selected_ix {
+            self.file_picker_selected_ix = next;
+            self.file_picker_scroll_handle.scroll_to_item(next);
+            cx.notify();
+        }
+        true
+    }
+
+    fn apply_selected_completion_if_open(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.apply_selected_skill_completion_if_open(window, cx) {
+            return true;
+        }
+        self.apply_selected_file_completion_if_open(window, cx)
+    }
+
+    fn move_completion_picker_selection(&mut self, delta: i32, cx: &mut Context<Self>) -> bool {
+        if self.current_skill_picker_state(cx).is_some() {
+            return self.move_skill_picker_selection(delta, cx);
+        }
+        self.move_file_picker_selection(delta, cx)
     }
 
     fn relative_time(unix_ts: u64) -> String {
@@ -977,12 +1605,14 @@ impl AppShell {
     fn build_thread_message(
         speaker: ThreadSpeaker,
         content: String,
+        image_refs: Vec<String>,
         cx: &mut Context<Self>,
     ) -> ThreadMessage {
         let view_state = Self::new_message_state(&content, cx);
         ThreadMessage {
             speaker,
             content,
+            image_refs,
             view_state,
             kind: ThreadMessageKind::Text,
         }
@@ -993,9 +1623,11 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> ThreadMessage {
         match message {
-            RenderableMessage::Text { speaker, content } => {
-                Self::build_thread_message(speaker, content, cx)
-            }
+            RenderableMessage::Text {
+                speaker,
+                content,
+                image_refs,
+            } => Self::build_thread_message(speaker, content, image_refs, cx),
             RenderableMessage::CommandExecution {
                 header,
                 status_label,
@@ -1006,6 +1638,7 @@ impl AppShell {
                 ThreadMessage {
                     speaker: ThreadSpeaker::Assistant,
                     content,
+                    image_refs: Vec::new(),
                     view_state,
                     kind: ThreadMessageKind::CommandExecution {
                         header,
@@ -1023,6 +1656,7 @@ impl AppShell {
                 ThreadMessage {
                     speaker: ThreadSpeaker::Assistant,
                     content: String::new(),
+                    image_refs: Vec::new(),
                     view_state,
                     kind: ThreadMessageKind::FileChange {
                         status_label,
@@ -1053,9 +1687,14 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         match renderable {
-            RenderableMessage::Text { speaker, content } => {
+            RenderableMessage::Text {
+                speaker,
+                content,
+                image_refs,
+            } => {
                 message.speaker = speaker;
                 message.content = content.clone();
+                message.image_refs = image_refs;
                 message.view_state = Self::new_message_state(&content, cx);
                 message.kind = ThreadMessageKind::Text;
             }
@@ -1072,6 +1711,7 @@ impl AppShell {
 
                 message.speaker = ThreadSpeaker::Assistant;
                 message.content = content.clone();
+                message.image_refs.clear();
                 message.view_state = Self::new_message_state(&content, cx);
                 message.kind = ThreadMessageKind::CommandExecution {
                     header,
@@ -1091,6 +1731,7 @@ impl AppShell {
 
                 message.speaker = ThreadSpeaker::Assistant;
                 message.content = String::new();
+                message.image_refs.clear();
                 message.view_state = Self::new_message_state("", cx);
                 message.kind = ThreadMessageKind::FileChange {
                     status_label,
@@ -1193,6 +1834,7 @@ impl AppShell {
                 RenderableMessage::Text {
                     speaker,
                     content: message.to_string(),
+                    image_refs: Vec::new(),
                 },
                 &mut used_chars,
                 &mut was_truncated,
@@ -1207,6 +1849,7 @@ impl AppShell {
             messages.push(RenderableMessage::Text {
                 speaker: ThreadSpeaker::Assistant,
                 content: "_Thread content truncated for performance._".to_string(),
+                image_refs: Vec::new(),
             });
         }
 
@@ -1257,6 +1900,18 @@ impl AppShell {
             RenderableMessage::FileChange { .. } => "",
         };
 
+        if let RenderableMessage::Text {
+            content,
+            image_refs,
+            ..
+        } = &message
+            && content.trim().is_empty()
+            && !image_refs.is_empty()
+        {
+            messages.push(message);
+            return;
+        }
+
         let Some(content) = Self::budgeted_content(raw_content, used_chars, was_truncated) else {
             if matches!(&message, RenderableMessage::FileChange { .. }) {
                 messages.push(message);
@@ -1265,7 +1920,15 @@ impl AppShell {
         };
 
         let message = match message {
-            RenderableMessage::Text { speaker, .. } => RenderableMessage::Text { speaker, content },
+            RenderableMessage::Text {
+                speaker,
+                image_refs,
+                ..
+            } => RenderableMessage::Text {
+                speaker,
+                content,
+                image_refs,
+            },
             RenderableMessage::CommandExecution {
                 header,
                 status_label,
@@ -1510,6 +2173,78 @@ impl AppShell {
         Some(lines.join("\n"))
     }
 
+    fn image_ref_for_message(path_or_url: &str) -> String {
+        let trimmed = path_or_url.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        if trimmed.starts_with("data:")
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+        {
+            return trimmed.to_string();
+        }
+
+        if let Some(path) = trimmed.strip_prefix("file://") {
+            if path.is_empty() {
+                return String::new();
+            }
+            return path.to_string();
+        }
+
+        if Path::new(trimmed).is_absolute() {
+            return trimmed.to_string();
+        }
+
+        trimmed.to_string()
+    }
+
+    fn image_ref_from_content_block(block: &Value) -> Option<String> {
+        let image_ref = block
+            .get("path")
+            .and_then(Value::as_str)
+            .or_else(|| block.get("url").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let image_ref = Self::image_ref_for_message(image_ref);
+        if image_ref.is_empty() {
+            None
+        } else {
+            Some(image_ref)
+        }
+    }
+
+    fn render_user_message_content(content_blocks: &[Value]) -> Option<UserMessageContent> {
+        let mut text_parts = Vec::new();
+        let mut image_refs = Vec::new();
+        content_blocks
+            .iter()
+            .for_each(|block| match block.get("type").and_then(Value::as_str) {
+                Some("text") => block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned)
+                    .into_iter()
+                    .for_each(|text| text_parts.push(text)),
+                Some("localImage") | Some("image") => {
+                    if let Some(image_ref) = Self::image_ref_from_content_block(block) {
+                        image_refs.push(image_ref);
+                    }
+                }
+                _ => {}
+            });
+
+        let text = text_parts.join("\n\n");
+        if text.is_empty() && image_refs.is_empty() {
+            None
+        } else {
+            Some(UserMessageContent { text, image_refs })
+        }
+    }
+
     fn renderable_message_from_tool_item(item: &Value) -> Option<RenderableMessage> {
         match item.get("type").and_then(Value::as_str) {
             Some("commandExecution") => Self::format_command_execution_item(item),
@@ -1518,6 +2253,7 @@ impl AppShell {
                 Self::format_web_search_item(item).map(|content| RenderableMessage::Text {
                     speaker: ThreadSpeaker::Assistant,
                     content,
+                    image_refs: Vec::new(),
                 })
             }
             _ => None,
@@ -1548,24 +2284,16 @@ impl AppShell {
                         else {
                             continue;
                         };
-                        let text_parts = content_blocks
-                            .iter()
-                            .filter(|block| {
-                                block.get("type").and_then(Value::as_str) == Some("text")
-                            })
-                            .filter_map(|block| block.get("text").and_then(Value::as_str))
-                            .map(str::trim)
-                            .filter(|text| !text.is_empty())
-                            .collect::<Vec<_>>();
-                        if text_parts.is_empty() {
+                        let Some(user_content) = Self::render_user_message_content(content_blocks)
+                        else {
                             continue;
-                        }
-                        let content = text_parts.join("\n\n");
+                        };
                         Self::push_renderable_item_with_budget(
                             &mut messages,
                             RenderableMessage::Text {
                                 speaker: ThreadSpeaker::User,
-                                content,
+                                content: user_content.text,
+                                image_refs: user_content.image_refs,
                             },
                             &mut used_chars,
                             &mut was_truncated,
@@ -1580,6 +2308,7 @@ impl AppShell {
                             RenderableMessage::Text {
                                 speaker: ThreadSpeaker::Assistant,
                                 content: text.to_string(),
+                                image_refs: Vec::new(),
                             },
                             &mut used_chars,
                             &mut was_truncated,
@@ -1614,6 +2343,7 @@ impl AppShell {
             messages.push(RenderableMessage::Text {
                 speaker: ThreadSpeaker::Assistant,
                 content: "_Thread content truncated for performance._".to_string(),
+                image_refs: Vec::new(),
             });
         }
 
@@ -1713,7 +2443,19 @@ impl AppShell {
     fn refresh_selected_thread(&mut self, cx: &mut Context<Self>) {
         if self.composing_new_thread_cwd.is_some() && self.selected_thread_id.is_none() {
             self.selected_thread_title = Some("New thread".to_string());
-            self.ensure_skills_for_active_workspace(cx);
+            self.ensure_composer_options_for_active_workspace(cx);
+            return;
+        }
+
+        if let Some(selected_thread_id) = self.selected_thread_id.as_deref()
+            && !self.threads.iter().any(|row| row.id == selected_thread_id)
+            && self.inflight_threads.contains(selected_thread_id)
+        {
+            // Keep the in-flight selection pinned while thread/list catches up with newly
+            // created threads. Falling back here can jump the UI to an older thread.
+            self.selected_thread_title
+                .get_or_insert_with(|| "New thread".to_string());
+            self.ensure_composer_options_for_active_workspace(cx);
             return;
         }
 
@@ -1729,7 +2471,7 @@ impl AppShell {
             self.loading_selected_thread = false;
             self.selected_thread_error = None;
             self.streaming_message_ix = None;
-            self.ensure_skills_for_active_workspace(cx);
+            self.ensure_composer_options_for_active_workspace(cx);
             return;
         };
 
@@ -1743,7 +2485,7 @@ impl AppShell {
             self.selected_thread_messages.clear();
             self.reset_live_tool_message_state();
             self.selected_thread_error = Some("thread log path is unavailable".to_string());
-            self.ensure_skills_for_active_workspace(cx);
+            self.ensure_composer_options_for_active_workspace(cx);
             return;
         };
 
@@ -1759,7 +2501,7 @@ impl AppShell {
                 self.selected_thread_error = Some(format!("failed to load session: {error}"));
             }
         }
-        self.ensure_skills_for_active_workspace(cx);
+        self.ensure_composer_options_for_active_workspace(cx);
     }
 
     fn select_thread_by_id(&mut self, thread_id: &str, cx: &mut Context<Self>) {
@@ -2064,59 +2806,58 @@ impl AppShell {
                     ),
             );
         if let Some(hint) = queue_hint {
-            header_row = header_row.child(
-                div()
-                    .text_xs()
-                    .text_color(overlay_color)
-                    .child(hint),
-            );
+            header_row = header_row.child(div().text_xs().text_color(overlay_color).child(hint));
         }
 
-        let option_rows = approval.options.iter().enumerate().map(|(option_ix, option)| {
-            let is_selected = option_ix == selected_ix;
-            let label_preview = compact_line(&option.label, 92);
+        let option_rows = approval
+            .options
+            .iter()
+            .enumerate()
+            .map(|(option_ix, option)| {
+                let is_selected = option_ix == selected_ix;
+                let label_preview = compact_line(&option.label, 92);
 
-            let row = div()
-                .w_full()
-                .rounded(px(8.))
-                .border_1()
-                .border_color(if is_selected { surface1 } else { surface0 })
-                .bg(if is_selected { surface0 } else { mantle })
-                .px(px(9.))
-                .py(px(6.))
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .cursor_pointer()
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |view, _, _, cx| {
-                        if view.set_approval_selection(option_ix) {
-                            cx.notify();
-                        }
-                    }),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .font_family(font_mono.clone())
-                        .text_color(overlay_color)
-                        .child(format!("{}.", option_ix + 1)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(text_color)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .child(label_preview),
-                );
-            row
-        });
+                let row = div()
+                    .w_full()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(if is_selected { surface1 } else { surface0 })
+                    .bg(if is_selected { surface0 } else { mantle })
+                    .px(px(9.))
+                    .py(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            if view.set_approval_selection(option_ix) {
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family(font_mono.clone())
+                            .text_color(overlay_color)
+                            .child(format!("{}.", option_ix + 1)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(text_color)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(label_preview),
+                    );
+                row
+            });
 
         let footer = div()
             .w_full()
@@ -2216,7 +2957,7 @@ impl AppShell {
         self.selected_thread_loaded_from_api_id = None;
         self.loading_selected_thread = false;
         self.streaming_message_ix = None;
-        self.ensure_skills_for_cwd(workspace_cwd.clone(), cx);
+        self.ensure_composer_options_for_cwd(workspace_cwd.clone(), cx);
         cx.notify();
     }
 
@@ -2242,6 +2983,16 @@ impl AppShell {
         self.loading_skills_cwds.clear();
         self.active_skills_cwd = self.cwd.clone();
         self.active_skills.clear();
+        self.files_by_cwd.clear();
+        self.loading_files_cwds.clear();
+        self.active_files_cwd = self.cwd.clone();
+        self.active_files.clear();
+        self.available_models.clear();
+        self.loading_model_options = false;
+        self.selected_model = None;
+        self.selected_reasoning_effort = None;
+        self.skill_picker_selected_ix = 0;
+        self.file_picker_selected_ix = 0;
         self.pending_approvals.clear();
         self.approval_selected_ix = 0;
     }
@@ -2335,10 +3086,13 @@ impl AppShell {
                     Ok(payload) => {
                         view.auth_error = None;
                         view.apply_account_read_payload(&payload);
-                        if view.is_authenticated && load_threads_if_authenticated {
-                            view.load_threads_from_server(Arc::clone(&server), cx);
+                        if view.is_authenticated {
+                            if load_threads_if_authenticated {
+                                view.load_threads_from_server(Arc::clone(&server), cx);
+                            }
+                            view.load_model_and_reasoning_options(Arc::clone(&server), cx);
                         } else {
-                            view.ensure_skills_for_active_workspace(cx);
+                            view.ensure_composer_options_for_active_workspace(cx);
                         }
                     }
                     Err(error) => {
@@ -2510,6 +3264,7 @@ impl AppShell {
                             let msg = Self::build_thread_message(
                                 ThreadSpeaker::Assistant,
                                 String::new(),
+                                Vec::new(),
                                 cx,
                             );
                             self.selected_thread_messages.push(msg);
@@ -2640,10 +3395,90 @@ impl AppShell {
         }
     }
 
+    const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "ico"];
+
+    fn is_image_path(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| Self::IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+    }
+
+    fn add_image_attachment(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.attached_images.contains(&path) {
+            self.attached_images.push(path);
+            cx.notify();
+        }
+    }
+
+    fn remove_image_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.attached_images.len() {
+            self.attached_images.remove(index);
+            cx.notify();
+        }
+    }
+
+    fn handle_dropped_paths(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        for path in paths.paths() {
+            if Self::is_image_path(path) {
+                self.add_image_attachment(path.to_path_buf(), cx);
+            }
+        }
+    }
+
+    fn handle_clipboard_paste(&mut self, cx: &mut Context<Self>) {
+        let Some(clipboard) = cx.read_from_clipboard() else {
+            return;
+        };
+
+        for entry in clipboard.entries() {
+            match entry {
+                ClipboardEntry::Image(image) => {
+                    let ext = match image.format {
+                        ImageFormat::Png => "png",
+                        ImageFormat::Jpeg => "jpg",
+                        ImageFormat::Webp => "webp",
+                        ImageFormat::Gif => "gif",
+                        ImageFormat::Svg => "svg",
+                        ImageFormat::Bmp => "bmp",
+                        ImageFormat::Tiff => "tiff",
+                        ImageFormat::Ico => "ico",
+                    };
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let tmp_path = std::env::temp_dir().join(format!("agent-hub-paste-{ts}.{ext}"));
+                    if fs::write(&tmp_path, &image.bytes).is_ok() {
+                        self.add_image_attachment(tmp_path, cx);
+                    }
+                }
+                ClipboardEntry::ExternalPaths(paths) => {
+                    for path in paths.paths() {
+                        if Self::is_image_path(path) {
+                            self.add_image_attachment(path.to_path_buf(), cx);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn image_file_name(path: &Path) -> String {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "image".to_string())
+    }
+
     fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let text = text.trim().to_string();
-        if text.is_empty() || self.selected_thread_is_busy() || self.has_pending_approval() {
+        let has_images = !self.attached_images.is_empty();
+        if (text.is_empty() && !has_images)
+            || self.selected_thread_is_busy()
+            || self.has_pending_approval()
+        {
             return;
         }
 
@@ -2655,6 +3490,8 @@ impl AppShell {
 
         let thread_id = self.selected_thread_id.clone();
         let cwd = self.active_composer_cwd();
+        let selected_model = self.selected_model.clone();
+        let selected_reasoning_effort = self.selected_reasoning_effort.clone();
         if let Some(thread_id) = thread_id.as_deref() {
             self.composing_new_thread_cwd = None;
             self.inflight_threads.insert(thread_id.to_string());
@@ -2662,33 +3499,52 @@ impl AppShell {
             self.pending_new_thread = true;
         }
 
+        let images = std::mem::take(&mut self.attached_images);
+
         self.input_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
+
+        let image_refs = images
+            .iter()
+            .filter_map(|path| path.to_str())
+            .map(Self::image_ref_for_message)
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        if text.is_empty() && image_refs.is_empty() {
+            return;
+        }
 
         self.selected_thread_messages
             .push(Self::build_thread_message(
                 ThreadSpeaker::User,
                 text.clone(),
+                image_refs,
                 cx,
             ));
         self.streaming_message_ix = None;
         cx.notify();
 
-        let mut turn_input = vec![json!({ "type": "text", "text": text.clone() })];
-        turn_input.extend(self.skill_input_items_for_text(&text));
+        let skill_items = self.skill_input_items_for_text(&text);
+        let turn_input = Self::build_user_turn_input(&text, &images, skill_items);
 
         cx.spawn(async move |view, cx| {
             let thread_id = if let Some(id) = thread_id {
                 id
             } else {
+                let mut thread_start_params = serde_json::Map::new();
+                thread_start_params.insert("cwd".to_string(), json!(cwd));
+                thread_start_params.insert("approvalPolicy".to_string(), json!("on-request"));
+                if let Some(model) = selected_model.clone() {
+                    thread_start_params.insert("model".to_string(), json!(model));
+                }
+                if let Some(effort) = selected_reasoning_effort.clone() {
+                    thread_start_params.insert("reasoningEffort".to_string(), json!(effort));
+                }
                 let start_result = server
                     .call(
                         RequestMethod::ThreadStart,
-                        json!({
-                            "cwd": cwd,
-                            "approvalPolicy": "on-request",
-                        }),
+                        Value::Object(thread_start_params),
                     )
                     .await;
                 match start_result {
@@ -2737,16 +3593,21 @@ impl AppShell {
                 }
             };
 
+            let mut turn_start_params = serde_json::Map::new();
+            turn_start_params.insert("threadId".to_string(), json!(thread_id));
+            turn_start_params.insert("input".to_string(), json!(turn_input));
+            turn_start_params.insert("cwd".to_string(), json!(cwd));
+            turn_start_params.insert("approvalPolicy".to_string(), json!("on-request"));
+            if let Some(model) = selected_model {
+                turn_start_params.insert("model".to_string(), json!(model));
+            }
+            if let Some(effort) = selected_reasoning_effort {
+                turn_start_params.insert("reasoningEffort".to_string(), json!(effort.clone()));
+                turn_start_params.insert("effort".to_string(), json!(effort));
+            }
+
             let result = server
-                .call(
-                    RequestMethod::TurnStart,
-                    json!({
-                        "threadId": thread_id,
-                        "input": turn_input,
-                        "cwd": cwd,
-                        "approvalPolicy": "on-request",
-                    }),
-                )
+                .call(RequestMethod::TurnStart, Value::Object(turn_start_params))
                 .await;
 
             let _ = view.update(cx, |view, cx| {
@@ -2769,11 +3630,33 @@ impl AppShell {
         })
         .detach();
     }
+
+    fn build_user_turn_input(
+        text: &str,
+        images: &[PathBuf],
+        mut skill_items: Vec<Value>,
+    ) -> Vec<Value> {
+        let mut turn_input = Vec::new();
+        for image_path in images {
+            if let Some(path_str) = image_path.to_str() {
+                turn_input.push(json!({ "type": "localImage", "path": path_str }));
+            }
+        }
+        if !text.is_empty() {
+            turn_input.push(json!({ "type": "text", "text": text }));
+        } else if !images.is_empty() {
+            turn_input
+                .push(json!({ "type": "text", "text": "Please analyze the attached image(s)." }));
+        }
+        turn_input.append(&mut skill_items);
+        turn_input
+    }
 }
 
 impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_load_threads(cx);
+        self.ensure_composer_options_for_active_workspace(cx);
         if self.is_authenticated {
             self.maybe_fetch_selected_thread_from_api(cx);
         }
@@ -2786,11 +3669,29 @@ impl Render for AppShell {
             self.skill_picker_selected_ix
                 .min(picker.items.len().saturating_sub(1))
         });
-        let can_send = !self.input_state.read(cx).value().trim().is_empty()
+        let file_picker = if skill_picker.is_some() {
+            None
+        } else {
+            self.current_file_picker_state(cx)
+        };
+        let file_picker_selected_ix = file_picker.as_ref().map(|picker| {
+            self.file_picker_selected_ix
+                .min(picker.items.len().saturating_sub(1))
+        });
+        let has_input = !self.input_state.read(cx).value().trim().is_empty()
+            || !self.attached_images.is_empty();
+        let can_send = has_input
             && !self.selected_thread_is_busy()
             && !self.has_pending_approval()
             && self.is_authenticated
             && self._app_server.is_some();
+        let attached_images = self.attached_images.clone();
+        let model_label = self.selected_model_label();
+        let reasoning_label = self.selected_reasoning_label();
+        let selected_model = self.selected_model.clone().unwrap_or_default();
+        let selected_reasoning_effort = self.selected_reasoning_effort.clone().unwrap_or_default();
+        let available_models = self.available_models.clone();
+        let reasoning_efforts = self.available_reasoning_efforts();
         let scroll_offset = self.scroll_handle.offset();
         let scroll_max = self.scroll_handle.max_offset();
         let distance_to_bottom = scroll_max.height + scroll_offset.y;
@@ -3264,16 +4165,6 @@ impl Render for AppShell {
                         ),
                     )
                     .child(
-                        SidebarGroup::new("Current").child(
-                            SidebarMenu::new().child(
-                                SidebarMenuItem::new("Implement kanban coding age...")
-                                    .icon(IconName::SquareTerminal)
-                                    .active(true)
-                                    .suffix(|_, _| div().text_xs().child("2d")),
-                            ),
-                        ),
-                    )
-                    .child(
                         SidebarGroup::new("Workspaces")
                             .child(SidebarMenu::new().children(thread_workspace_items)),
                     )
@@ -3339,28 +4230,90 @@ impl Render for AppShell {
                                                         .enumerate()
                                                         .map(|(message_ix, message)| {
                                                 match message.speaker {
-                                                    ThreadSpeaker::User => div()
-                                                        .w_full()
-                                                        .mb(px(14.))
-                                                        .flex()
-                                                        .justify_end()
-                                                        .child(
-                                                            div()
-                                                                .max_w(px(700.))
-                                                                .bg(surface0)
-                                                                .rounded(px(14.))
-                                                                .px(px(14.))
-                                                                .py(px(10.))
-                                                                .text_color(text_color)
-                                                                .child(
-                                                                    TextView::new(
-                                                                        &message.view_state,
-                                                                    )
-                                                                    .text_color(text_color)
-                                                                    .selectable(true),
-                                                                ),
-                                                        )
-                                                        .into_any_element(),
+                                                    ThreadSpeaker::User => {
+                                                        let image_refs = message.image_refs.clone();
+                                                        let has_text =
+                                                            !message.content.trim().is_empty();
+                                                        div()
+                                                            .w_full()
+                                                            .mb(px(14.))
+                                                            .flex()
+                                                            .justify_end()
+                                                            .child(
+                                                                div()
+                                                                    .max_w(px(700.))
+                                                                    .flex()
+                                                                    .flex_col()
+                                                                    .items_end()
+                                                                    .gap(px(8.))
+                                                                    .when(!image_refs.is_empty(), {
+                                                                        let image_refs = image_refs;
+                                                                        move |this| {
+                                                                            this.child(
+                                                                                div()
+                                                                                    .w_full()
+                                                                                    .max_w(px(390.))
+                                                                                    .flex()
+                                                                                    .flex_wrap()
+                                                                                    .justify_end()
+                                                                                    .gap(px(6.))
+                                                                                    .children(
+                                                                                        image_refs
+                                                                                            .into_iter()
+                                                                                            .map(
+                                                                                                |image_ref| {
+                                                                                                    let image = if Path::new(&image_ref)
+                                                                                                        .is_absolute()
+                                                                                                    {
+                                                                                                        img(PathBuf::from(
+                                                                                                            image_ref
+                                                                                                                .clone(),
+                                                                                                        ))
+                                                                                                    } else {
+                                                                                                        img(image_ref)
+                                                                                                    };
+                                                                                                    div()
+                                                                                                        .w(px(124.))
+                                                                                                        .h(px(96.))
+                                                                                                        .rounded(px(10.))
+                                                                                                        .overflow_hidden()
+                                                                                                        .border_1()
+                                                                                                        .border_color(surface1)
+                                                                                                        .bg(surface0)
+                                                                                                        .child(
+                                                                                                            image
+                                                                                                                .size_full()
+                                                                                                                .object_fit(
+                                                                                                                    gpui::ObjectFit::Contain,
+                                                                                                                ),
+                                                                                                        )
+                                                                                                },
+                                                                                            ),
+                                                                                    ),
+                                                                            )
+                                                                        }
+                                                                    })
+                                                                    .when(has_text, |this| {
+                                                                        this.child(
+                                                                            div()
+                                                                                .w_full()
+                                                                                .bg(surface0)
+                                                                                .rounded(px(14.))
+                                                                                .px(px(14.))
+                                                                                .py(px(10.))
+                                                                                .text_color(text_color)
+                                                                                .child(
+                                                                                    TextView::new(
+                                                                                        &message.view_state,
+                                                                                    )
+                                                                                    .text_color(text_color)
+                                                                                    .selectable(true),
+                                                                                ),
+                                                                        )
+                                                                    }),
+                                                            )
+                                                            .into_any_element()
+                                                    }
                                                     ThreadSpeaker::Assistant => {
                                                         match &message.kind {
                                                             ThreadMessageKind::Text => div()
@@ -3534,6 +4487,20 @@ impl Render for AppShell {
                                                                                                         let total_del = file_diff.deletions;
                                                                                                         let path = file_diff.path.clone();
                                                                                                         let font_mono = font_mono.clone();
+                                                                                                        let max_lineno = file_diff
+                                                                                                            .rows
+                                                                                                            .iter()
+                                                                                                            .filter_map(|row| match row {
+                                                                                                                diff_view::DiffRow::Line(line) => {
+                                                                                                                    line.old_lineno.max(line.new_lineno)
+                                                                                                                }
+                                                                                                                diff_view::DiffRow::HunkHeader(_) => None,
+                                                                                                            })
+                                                                                                            .max()
+                                                                                                            .unwrap_or(0);
+                                                                                                        let line_number_digits = max_lineno.max(1).to_string().len() as f32;
+                                                                                                        let line_number_column_width =
+                                                                                                            (line_number_digits * 9. + 16.).max(44.);
 
                                                                                                         div()
                                                                                                             .flex()
@@ -3579,11 +4546,12 @@ impl Render for AppShell {
                                                                                                             .child(
                                                                                                                 div()
                                                                                                                     .w_full()
-                                                                                                                    .overflow_x_hidden()
+                                                                                                                    .overflow_x_scrollbar()
                                                                                                                     .child(
                                                                                                                         div()
                                                                                                                             .flex()
                                                                                                                             .flex_col()
+                                                                                                                            .min_w_full()
                                                                                                                             .font_family(font_mono.clone())
                                                                                                                             .text_sm()
                                                                                                                             .children(
@@ -3597,6 +4565,7 @@ impl Render for AppShell {
                                                                                                                                                 .bg(surface0)
                                                                                                                                                 .text_color(subtext_color)
                                                                                                                                                 .text_xs()
+                                                                                                                                                .whitespace_nowrap()
                                                                                                                                                 .child(h.raw.clone())
                                                                                                                                                 .into_any_element()
                                                                                                                                         }
@@ -3617,45 +4586,48 @@ impl Render for AppShell {
                                                                                                                                             };
 
                                                                                                                                             div()
-                                                                                                                                                .w_full()
-                                                                                                                                                .flex()
-                                                                                                                                                .flex_row()
-                                                                                                                                                .bg(row_bg)
-                                                                                                                                                .child(
-                                                                                                                                                    div()
+                                                                                                                                                .min_w_full()
+                                                                                                                                               .flex()
+                                                                                                                                               .flex_row()
+                                                                                                                                               .bg(row_bg)
+                                                                                                                                               .child(
+                                                                                                                                                   div()
                                                                                                                                                         .w(px(3.))
                                                                                                                                                         .h_full()
                                                                                                                                                         .bg(bar_color),
                                                                                                                                                 )
-                                                                                                                                                .child(
-                                                                                                                                                    div()
-                                                                                                                                                        .w(px(44.))
+                                                                                                                                               .child(
+                                                                                                                                                   div()
+                                                                                                                                                        .w(px(line_number_column_width))
                                                                                                                                                         .flex_shrink_0()
                                                                                                                                                         .px(px(6.))
                                                                                                                                                         .py(px(1.))
                                                                                                                                                         .text_color(subtext_color)
                                                                                                                                                         .text_right()
+                                                                                                                                                        .whitespace_nowrap()
                                                                                                                                                         .child(old_ln),
-                                                                                                                                                )
-                                                                                                                                                .child(
-                                                                                                                                                    div()
-                                                                                                                                                        .w(px(44.))
+                                                                                                                                               )
+                                                                                                                                               .child(
+                                                                                                                                                   div()
+                                                                                                                                                        .w(px(line_number_column_width))
                                                                                                                                                         .flex_shrink_0()
                                                                                                                                                         .px(px(6.))
                                                                                                                                                         .py(px(1.))
                                                                                                                                                         .text_color(subtext_color)
                                                                                                                                                         .text_right()
+                                                                                                                                                        .whitespace_nowrap()
                                                                                                                                                         .child(new_ln),
-                                                                                                                                                )
-                                                                                                                                                .child(
-                                                                                                                                                    div()
+                                                                                                                                               )
+                                                                                                                                               .child(
+                                                                                                                                                   div()
                                                                                                                                                         .flex_1()
                                                                                                                                                         .px(px(8.))
                                                                                                                                                         .py(px(1.))
                                                                                                                                                         .text_color(text_color)
+                                                                                                                                                        .whitespace_nowrap()
                                                                                                                                                         .child(display_text),
-                                                                                                                                                )
-                                                                                                                                                .into_any_element()
+                                                                                                                                               )
+                                                                                                                                               .into_any_element()
                                                                                                                                         }
                                                                                                                                     }
                                                                                                                                 }),
@@ -3825,6 +4797,11 @@ impl Render for AppShell {
                                         spread_radius: px(0.),
                                         offset: gpui::point(px(0.), px(2.)),
                                     }])
+                                    .on_drop(cx.listener(
+                                        |view, paths: &ExternalPaths, _, cx| {
+                                            view.handle_dropped_paths(paths, cx);
+                                        },
+                                    ))
                                     .p(px(10.))
                                     .flex()
                                     .flex_col()
@@ -3842,6 +4819,95 @@ impl Render for AppShell {
                                         ),
                                         |this, panel| this.child(panel),
                                     )
+                                    .when(!attached_images.is_empty(), {
+                                        let this = this.clone();
+                                        move |el| {
+                                            el.child(
+                                                div()
+                                                    .w_full()
+                                                    .flex()
+                                                    .flex_wrap()
+                                                    .gap(px(8.))
+                                                    .px(px(4.))
+                                                    .children(
+                                                        attached_images
+                                                            .iter()
+                                                            .enumerate()
+                                                            .map(|(ix, path)| {
+                                                                let file_name =
+                                                                    AppShell::image_file_name(path);
+                                                                let display_name =
+                                                                    AppShell::truncate(
+                                                                        &file_name,
+                                                                        18,
+                                                                    );
+                                                                let path_clone = path.clone();
+                                                                let this = this.clone();
+
+                                                                div()
+                                                                    .id(format!(
+                                                                        "attachment-{ix}"
+                                                                    ))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap(px(6.))
+                                                                    .px(px(8.))
+                                                                    .py(px(4.))
+                                                                    .rounded(px(10.))
+                                                                    .border_1()
+                                                                    .border_color(surface1)
+                                                                    .bg(surface0)
+                                                                    .child(
+                                                                        img(path_clone)
+                                                                            .size(px(24.))
+                                                                            .rounded(px(4.))
+                                                                            .object_fit(
+                                                                                gpui::ObjectFit::Cover,
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_xs()
+                                                                            .text_color(
+                                                                                text_color,
+                                                                            )
+                                                                            .max_w(px(120.))
+                                                                            .overflow_hidden()
+                                                                            .text_ellipsis()
+                                                                            .whitespace_nowrap()
+                                                                            .child(
+                                                                                display_name,
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .cursor_pointer()
+                                                                            .on_mouse_down(
+                                                                                gpui::MouseButton::Left,
+                                                                                {
+                                                                                    let this = this.clone();
+                                                                                    move |_, _: &mut Window, cx: &mut App| {
+                                                                                        let _ = this.update(cx, |view, cx| {
+                                                                                            view.remove_image_attachment(ix, cx);
+                                                                                        });
+                                                                                    }
+                                                                                },
+                                                                            )
+                                                                            .child(
+                                                                                Icon::new(
+                                                                                    IconName::Close,
+                                                                                )
+                                                                                .size(px(12.))
+                                                                                .text_color(
+                                                                                    overlay_color,
+                                                                                ),
+                                                                            ),
+                                                                    )
+                                                            }),
+                                                    ),
+                                            )
+                                        }
+                                    })
                                     .when_some(skill_picker.clone(), |this, skill_picker| {
                                         this.child(
                                             div()
@@ -3985,13 +5051,154 @@ impl Render for AppShell {
                                                 ),
                                         )
                                     })
+                                    .when_some(file_picker.clone(), |this, file_picker| {
+                                        this.child(
+                                            div()
+                                                .id("file-picker-scroll")
+                                                .w_full()
+                                                .max_h(px(240.))
+                                                .relative()
+                                                .rounded(px(16.))
+                                                .bg(mantle)
+                                                .border_1()
+                                                .border_color(surface1)
+                                                .overflow_y_scroll()
+                                                .track_scroll(&self.file_picker_scroll_handle)
+                                                .flex()
+                                                .flex_col()
+                                                .items_stretch()
+                                                .children(
+                                                    file_picker
+                                                        .items
+                                                        .iter()
+                                                        .enumerate()
+                                                        .map(|(ix, file_path)| {
+                                                            let file_path = file_path.clone();
+                                                            let display_name = file_path
+                                                                .rsplit('/')
+                                                                .next()
+                                                                .unwrap_or(file_path.as_str())
+                                                                .to_string();
+                                                            let parent_path = file_path
+                                                                .rsplit_once('/')
+                                                                .map(|(parent, _)| {
+                                                                    parent.to_string()
+                                                                })
+                                                                .unwrap_or_default();
+                                                            let is_primary =
+                                                                file_picker_selected_ix
+                                                                    == Some(ix);
+                                                            div()
+                                                                .w_full()
+                                                                .min_w_0()
+                                                                .px(px(12.))
+                                                                .py(px(5.))
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap(px(8.))
+                                                                .when(is_primary, |this| {
+                                                                    this.bg(surface0)
+                                                                })
+                                                                .hover(|this| this.bg(surface0))
+                                                                .cursor_pointer()
+                                                                .on_mouse_move(cx.listener(
+                                                                    move |view, _, _, cx| {
+                                                                        if view.file_picker_selected_ix
+                                                                            != ix
+                                                                        {
+                                                                            view.file_picker_selected_ix =
+                                                                                ix;
+                                                                            cx.notify();
+                                                                        }
+                                                                    },
+                                                                ))
+                                                                .on_mouse_down(
+                                                                    gpui::MouseButton::Left,
+                                                                    cx.listener(
+                                                                        move |view,
+                                                                              _,
+                                                                              window,
+                                                                              cx| {
+                                                                            view.apply_file_completion(
+                                                                                &file_path,
+                                                                                window,
+                                                                                cx,
+                                                                            );
+                                                                            cx.notify();
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .child(
+                                                                    Icon::new(
+                                                                        IconName::File,
+                                                                    )
+                                                                    .size(px(13.))
+                                                                    .text_color(overlay_color),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .gap(px(6.))
+                                                                        .min_w_0()
+                                                                        .flex_1()
+                                                                        .overflow_x_hidden()
+                                                                        .child(
+                                                                            div()
+                                                                                .flex_shrink_0()
+                                                                                .max_w(px(340.))
+                                                                                .overflow_hidden()
+                                                                                .text_ellipsis()
+                                                                                .whitespace_nowrap()
+                                                                                .text_sm()
+                                                                                .font_weight(
+                                                                                    gpui::FontWeight::MEDIUM,
+                                                                                )
+                                                                                .text_color(
+                                                                                    text_color,
+                                                                                )
+                                                                                .child(
+                                                                                    display_name,
+                                                                                ),
+                                                                        )
+                                                                        .when(
+                                                                            !parent_path.is_empty(),
+                                                                            |this| {
+                                                                                this.child(
+                                                                                    div()
+                                                                                        .flex_1()
+                                                                                        .min_w_0()
+                                                                                        .overflow_hidden()
+                                                                                        .text_ellipsis()
+                                                                                        .whitespace_nowrap()
+                                                                                        .text_xs()
+                                                                                        .text_color(
+                                                                                            subtext_color,
+                                                                                        )
+                                                                                        .child(
+                                                                                            format!(
+                                                                                                "· {parent_path}"
+                                                                                            ),
+                                                                                        ),
+                                                                                )
+                                                                            },
+                                                                        ),
+                                                                )
+                                                        }),
+                                                )
+                                                .vertical_scrollbar(
+                                                    &self.file_picker_scroll_handle,
+                                                ),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .w_full()
                                             .min_h(px(43.))
                                             .capture_action(cx.listener(
                                                 |view, _: &InputMoveUp, window, cx| {
-                                                    if view.move_skill_picker_selection(-1, cx) {
+                                                    if view.move_completion_picker_selection(-1, cx)
+                                                    {
                                                         window.prevent_default();
                                                         cx.stop_propagation();
                                                     }
@@ -3999,7 +5206,8 @@ impl Render for AppShell {
                                             ))
                                             .capture_action(cx.listener(
                                                 |view, _: &InputMoveDown, window, cx| {
-                                                    if view.move_skill_picker_selection(1, cx) {
+                                                    if view.move_completion_picker_selection(1, cx)
+                                                    {
                                                         window.prevent_default();
                                                         cx.stop_propagation();
                                                     }
@@ -4008,12 +5216,33 @@ impl Render for AppShell {
                                             .capture_action(cx.listener(
                                                 |view, action: &InputEnter, window, cx| {
                                                     if !action.secondary
-                                                        && view.apply_selected_skill_completion_if_open(
-                                                            window, cx,
+                                                        && view.apply_selected_completion_if_open(
+                                                            window,
+                                                            cx,
                                                         )
                                                     {
                                                         window.prevent_default();
                                                         cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
+                                            .capture_action(cx.listener(
+                                                |view, _: &InputPaste, window, cx| {
+                                                    if let Some(clipboard) =
+                                                        cx.read_from_clipboard()
+                                                    {
+                                                        let has_image =
+                                                            clipboard.entries().iter().any(|e| {
+                                                                matches!(
+                                                                    e,
+                                                                    ClipboardEntry::Image(_)
+                                                                )
+                                                            });
+                                                        if has_image {
+                                                            view.handle_clipboard_paste(cx);
+                                                            window.prevent_default();
+                                                            cx.stop_propagation();
+                                                        }
                                                     }
                                                 },
                                             ))
@@ -4043,36 +5272,178 @@ impl Render for AppShell {
                                                     .items_center()
                                                     .gap(px(18.))
                                                     .child(
-                                                        Icon::new(IconName::Plus)
-                                                            .size(px(24.))
-                                                            .text_color(overlay_color),
-                                                    )
-                                                    .child(
                                                         div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(8.))
-                                                            .text_sm()
-                                                            .text_color(overlay_color)
-                                                            .child("GPT-5.3-Codex")
+                                                            .cursor_pointer()
+                                                            .on_mouse_down(
+                                                                gpui::MouseButton::Left,
+                                                                cx.listener(
+                                                                    |_view, _, _, cx| {
+                                                                        let paths_rx =
+                                                                            cx.prompt_for_paths(
+                                                                                gpui::PathPromptOptions {
+                                                                                    files: true,
+                                                                                    directories: false,
+                                                                                    multiple: true,
+                                                                                    prompt: None,
+                                                                                },
+                                                                            );
+                                                                        cx.spawn(
+                                                                            async move |view, cx| {
+                                                                                if let Ok(Ok(Some(selected))) = paths_rx.await {
+                                                                                    let _ = view.update(cx, |view, cx| {
+                                                                                        for path in selected {
+                                                                                            if AppShell::is_image_path(&path) {
+                                                                                                view.add_image_attachment(path, cx);
+                                                                                            }
+                                                                                        }
+                                                                                    });
+                                                                                }
+                                                                            },
+                                                                        )
+                                                                        .detach();
+                                                                    },
+                                                                ),
+                                                            )
                                                             .child(
-                                                                Icon::new(IconName::ChevronDown)
-                                                                    .size(px(16.))
+                                                                Icon::new(IconName::Plus)
+                                                                    .size(px(24.))
                                                                     .text_color(overlay_color),
                                                             ),
                                                     )
                                                     .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(8.))
-                                                            .text_sm()
+                                                        Button::new("composer-model-selector")
+                                                            .ghost()
+                                                            .xsmall()
+                                                            .label(model_label)
+                                                            .dropdown_caret(true)
                                                             .text_color(overlay_color)
-                                                            .child("High")
-                                                            .child(
-                                                                Icon::new(IconName::ChevronDown)
-                                                                    .size(px(16.))
-                                                                    .text_color(overlay_color),
+                                                            .disabled(
+                                                                self.loading_model_options
+                                                                    || available_models.is_empty(),
+                                                            )
+                                                            .dropdown_menu_with_anchor(
+                                                                gpui::Corner::BottomLeft,
+                                                                {
+                                                                    let this = this.clone();
+                                                                    let available_models =
+                                                                        available_models.clone();
+                                                                    let selected_model =
+                                                                        selected_model.clone();
+                                                                    move |menu: PopupMenu,
+                                                                          _window: &mut Window,
+                                                                          _cx: &mut gpui::Context<
+                                                                        PopupMenu,
+                                                                    >| {
+                                                                        let mut menu = menu;
+                                                                        if available_models.is_empty() {
+                                                                            return menu.label(
+                                                                                "No models available",
+                                                                            );
+                                                                        }
+
+                                                                        for option in &available_models {
+                                                                            let model =
+                                                                                option.model.clone();
+                                                                            let label = option
+                                                                                .display_name
+                                                                                .clone();
+                                                                            let checked = model
+                                                                                == selected_model;
+                                                                            menu = menu.item(
+                                                                                PopupMenuItem::new(
+                                                                                    label,
+                                                                                )
+                                                                                .checked(checked)
+                                                                                .on_click({
+                                                                                    let this = this
+                                                                                        .clone();
+                                                                                    move |_, _, cx| {
+                                                                                        let _ = this
+                                                                                            .update(
+                                                                                                cx,
+                                                                                                |view, cx| {
+                                                                                                    view.selected_model =
+                                                                                                        Some(model.clone());
+                                                                                                    view.normalize_selected_reasoning_effort();
+                                                                                                    cx.notify();
+                                                                                                },
+                                                                                            );
+                                                                                    }
+                                                                                }),
+                                                                            );
+                                                                        }
+
+                                                                        menu
+                                                                    }
+                                                                },
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        Button::new("composer-reasoning-selector")
+                                                            .ghost()
+                                                            .xsmall()
+                                                            .label(reasoning_label)
+                                                            .dropdown_caret(true)
+                                                            .text_color(overlay_color)
+                                                            .disabled(
+                                                                self.loading_model_options
+                                                                    || reasoning_efforts.is_empty(),
+                                                            )
+                                                            .dropdown_menu_with_anchor(
+                                                                gpui::Corner::BottomLeft,
+                                                                {
+                                                                    let this = this.clone();
+                                                                    let reasoning_efforts =
+                                                                        reasoning_efforts.clone();
+                                                                    let selected_reasoning_effort =
+                                                                        selected_reasoning_effort
+                                                                            .clone();
+                                                                    move |menu: PopupMenu,
+                                                                          _window: &mut Window,
+                                                                          _cx: &mut gpui::Context<
+                                                                        PopupMenu,
+                                                                    >| {
+                                                                        let mut menu = menu;
+                                                                        if reasoning_efforts.is_empty() {
+                                                                            return menu.label(
+                                                                                "No reasoning options",
+                                                                            );
+                                                                        }
+
+                                                                        for effort in &reasoning_efforts {
+                                                                            let effort =
+                                                                                effort.clone();
+                                                                            let checked = effort
+                                                                                == selected_reasoning_effort;
+                                                                            let label = AppShell::format_reasoning_effort_label(
+                                                                                &effort,
+                                                                            );
+                                                                            menu = menu.item(
+                                                                                PopupMenuItem::new(
+                                                                                    label,
+                                                                                )
+                                                                                .checked(checked)
+                                                                                .on_click({
+                                                                                    let this = this
+                                                                                        .clone();
+                                                                                    move |_, _, cx| {
+                                                                                        let _ = this
+                                                                                            .update(
+                                                                                                cx,
+                                                                                                |view, cx| {
+                                                                                                    view.selected_reasoning_effort =
+                                                                                                        Some(effort.clone());
+                                                                                                    cx.notify();
+                                                                                                },
+                                                                                            );
+                                                                                    }
+                                                                                }),
+                                                                            );
+                                                                        }
+
+                                                                        menu
+                                                                    }
+                                                                },
                                                             ),
                                                     ),
                                             )
@@ -4081,12 +5452,6 @@ impl Render for AppShell {
                                                     .flex()
                                                     .items_center()
                                                     .gap(px(12.))
-                                                    .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .text_color(overlay_color)
-                                                            .child("0."),
-                                                    )
                                                     .child(
                                                         div()
                                                             .size(px(34.))
@@ -4145,6 +5510,8 @@ fn main() {
         theme.accent_foreground = text_color;
         theme.link = blue_color;
         theme.link_hover = blue_color;
+        theme.font_size = px(15.);
+        theme.mono_font_size = px(12.);
 
         let bounds = Bounds::centered(None, size(px(1_520.), px(920.)), cx);
 
@@ -4193,8 +5560,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppShell, RenderableMessage, ThreadSpeaker};
+    use super::{AppShell, RenderableMessage, ThreadSpeaker, file_token_before_cursor};
     use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn format_command_execution_item_includes_metadata_and_output() {
@@ -4227,6 +5595,17 @@ mod tests {
             }
             other => panic!("expected command execution renderable message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn file_token_before_cursor_detects_at_trigger_with_path_query() {
+        let token = file_token_before_cursor("Please inspect @src/main");
+        assert_eq!(token, Some((15, "src/main".to_string())));
+    }
+
+    #[test]
+    fn file_token_before_cursor_ignores_email_like_text() {
+        assert_eq!(file_token_before_cursor("owner@example.com"), None);
     }
 
     #[test]
@@ -4296,7 +5675,10 @@ mod tests {
                             {
                                 "type": "userMessage",
                                 "id": "u1",
-                                "content": [{ "type": "text", "text": "run ls" }]
+                                "content": [
+                                    { "type": "localImage", "path": "/tmp/repo/screenshot.png" },
+                                    { "type": "text", "text": "run ls" }
+                                ]
                             },
                             {
                                 "type": "commandExecution",
@@ -4349,8 +5731,9 @@ mod tests {
             &messages[0],
             RenderableMessage::Text {
                 speaker: ThreadSpeaker::User,
-                ..
-            }
+                content,
+                image_refs,
+            } if content == "run ls" && image_refs == &vec!["/tmp/repo/screenshot.png".to_string()]
         ));
         assert!(matches!(
             &messages[1],
@@ -4361,6 +5744,7 @@ mod tests {
             RenderableMessage::Text {
                 speaker: ThreadSpeaker::Assistant,
                 content,
+                ..
             } if content.contains("**Web search**")
         ));
         assert!(matches!(&messages[3], RenderableMessage::FileChange { .. }));
@@ -4369,7 +5753,66 @@ mod tests {
             RenderableMessage::Text {
                 speaker: ThreadSpeaker::Assistant,
                 content,
+                ..
             } if content == "done"
         ));
+    }
+
+    #[test]
+    fn renderable_messages_from_thread_response_renders_image_url_blocks() {
+        let payload = json!({
+            "thread": {
+                "turns": [
+                    {
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "u1",
+                                "content": [
+                                    { "type": "image", "url": "data:image/png;base64,AAA" },
+                                    { "type": "text", "text": "testing" }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        let messages = AppShell::renderable_messages_from_thread_response(&payload)
+            .expect("thread response should parse");
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0],
+            RenderableMessage::Text {
+                speaker: ThreadSpeaker::User,
+                content,
+                image_refs,
+            } if content == "testing" && image_refs == &vec!["data:image/png;base64,AAA".to_string()]
+        ));
+    }
+
+    #[test]
+    fn build_user_turn_input_places_images_before_text() {
+        let images = vec![PathBuf::from("/tmp/repo/screenshot.png")];
+        let turn_input = AppShell::build_user_turn_input("run ls", &images, Vec::new());
+        assert_eq!(turn_input.len(), 2);
+        assert_eq!(
+            turn_input[0],
+            json!({ "type": "localImage", "path": "/tmp/repo/screenshot.png" })
+        );
+        assert_eq!(turn_input[1], json!({ "type": "text", "text": "run ls" }));
+    }
+
+    #[test]
+    fn image_ref_for_message_keeps_absolute_paths_for_local_files() {
+        let image_ref = AppShell::image_ref_for_message("/tmp/repo/screenshot.png");
+        assert_eq!(image_ref, "/tmp/repo/screenshot.png");
+    }
+
+    #[test]
+    fn image_ref_for_message_strips_file_scheme_from_local_file_urls() {
+        let image_ref = AppShell::image_ref_for_message("file:///tmp/repo/screenshot.png");
+        assert_eq!(image_ref, "/tmp/repo/screenshot.png");
     }
 }
