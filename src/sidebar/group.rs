@@ -1,9 +1,10 @@
 use super::SidebarItem;
 use gpui::{
-    App, ElementId, IntoElement, ParentElement, SharedString, Styled as _, Window, div,
+    AnyElement, App, ElementId, IntoElement, ParentElement, SharedString, Styled as _, Window, div,
     prelude::FluentBuilder as _,
 };
 use gpui_component::{ActiveTheme, Collapsible, h_flex, v_flex};
+use std::rc::Rc;
 
 /// A group of items in the [`super::Sidebar`].
 #[derive(Clone)]
@@ -11,6 +12,7 @@ pub struct SidebarGroup<E: SidebarItem + 'static> {
     label: SharedString,
     collapsed: bool,
     children: Vec<E>,
+    suffix: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>>,
 }
 
 impl<E: SidebarItem> SidebarGroup<E> {
@@ -20,6 +22,7 @@ impl<E: SidebarItem> SidebarGroup<E> {
             label: label.into(),
             collapsed: false,
             children: Vec::new(),
+            suffix: None,
         }
     }
 
@@ -34,6 +37,18 @@ impl<E: SidebarItem> SidebarGroup<E> {
     /// See also [`SidebarGroup::child`].
     pub fn children(mut self, children: impl IntoIterator<Item = E>) -> Self {
         self.children.extend(children);
+        self
+    }
+
+    /// Set the suffix for the group header.
+    pub fn suffix<F, T>(mut self, builder: F) -> Self
+    where
+        F: Fn(&mut Window, &mut App) -> T + 'static,
+        T: IntoElement,
+    {
+        self.suffix = Some(Rc::new(move |window, cx| {
+            builder(window, cx).into_any_element()
+        }));
         self
     }
 }
@@ -57,6 +72,8 @@ impl<E: SidebarItem> SidebarItem for SidebarGroup<E> {
         cx: &mut App,
     ) -> impl IntoElement {
         let id = id.into();
+        let label = self.label;
+        let suffix = self.suffix;
 
         v_flex()
             .relative()
@@ -65,11 +82,14 @@ impl<E: SidebarItem> SidebarItem for SidebarGroup<E> {
                     h_flex()
                         .flex_shrink_0()
                         .px_2()
+                        .justify_between()
+                        .items_center()
                         .rounded(cx.theme().radius)
                         .text_xs()
                         .text_color(cx.theme().sidebar_foreground.opacity(0.7))
                         .h_8()
-                        .child(self.label),
+                        .child(label)
+                        .when_some(suffix, |this, suffix| this.child(suffix(window, cx))),
                 )
             })
             .child(

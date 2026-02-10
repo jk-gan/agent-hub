@@ -33,6 +33,55 @@ pub trait SidebarItem: Collapsible + Clone {
     ) -> impl IntoElement;
 }
 
+/// A type-erased sidebar item for mixing common sidebar content types.
+#[derive(Clone)]
+pub enum AnySidebarItem {
+    Menu(SidebarMenu),
+    Group(SidebarGroup<SidebarMenu>),
+}
+
+impl From<SidebarMenu> for AnySidebarItem {
+    fn from(value: SidebarMenu) -> Self {
+        Self::Menu(value)
+    }
+}
+
+impl From<SidebarGroup<SidebarMenu>> for AnySidebarItem {
+    fn from(value: SidebarGroup<SidebarMenu>) -> Self {
+        Self::Group(value)
+    }
+}
+
+impl Collapsible for AnySidebarItem {
+    fn is_collapsed(&self) -> bool {
+        match self {
+            Self::Menu(item) => item.is_collapsed(),
+            Self::Group(item) => item.is_collapsed(),
+        }
+    }
+
+    fn collapsed(self, collapsed: bool) -> Self {
+        match self {
+            Self::Menu(item) => Self::Menu(item.collapsed(collapsed)),
+            Self::Group(item) => Self::Group(item.collapsed(collapsed)),
+        }
+    }
+}
+
+impl SidebarItem for AnySidebarItem {
+    fn render(
+        self,
+        id: impl Into<ElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        match self {
+            Self::Menu(item) => item.render(id, window, cx).into_any_element(),
+            Self::Group(item) => item.render(id, window, cx).into_any_element(),
+        }
+    }
+}
+
 /// A Sidebar element that can contain collapsible child elements.
 #[derive(IntoElement)]
 pub struct Sidebar<E: SidebarItem + 'static> {
@@ -97,14 +146,14 @@ impl<E: SidebarItem> Sidebar<E> {
     }
 
     /// Add a child element to the sidebar, the child must implement `Collapsible`
-    pub fn child(mut self, child: E) -> Self {
-        self.content.push(child);
+    pub fn child(mut self, child: impl Into<E>) -> Self {
+        self.content.push(child.into());
         self
     }
 
     /// Add multiple children to the sidebar, the children must implement `Collapsible`
-    pub fn children(mut self, children: impl IntoIterator<Item = E>) -> Self {
-        self.content.extend(children);
+    pub fn children(mut self, children: impl IntoIterator<Item = impl Into<E>>) -> Self {
+        self.content.extend(children.into_iter().map(Into::into));
         self
     }
 }
@@ -221,15 +270,15 @@ impl<E: SidebarItem> RenderOnce for Sidebar<E> {
                 Side::Right => this.border_l_1(),
             })
             .refine_style(&self.style)
-            .when(self.collapsed, |this| this.w(COLLAPSED_WIDTH).gap_2())
+            .when(self.collapsed, |this| this.w(px(0.)).hidden())
             .when_some(self.header.take(), |this, header| {
                 this.child(
                     h_flex()
                         .id("header")
-                        .pt_3()
+                        .pt(px(34.))
                         .px_3()
                         .gap_2()
-                        .when(self.collapsed, |this| this.pt_2().px_2())
+                        .when(self.collapsed, |this| this.px_2())
                         .child(header),
                 )
             })

@@ -10,14 +10,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use codex::app_server::{AppServer, AppServerError, RequestMethod, ServerNotification};
+use codex::app_server::{AppServer, RequestMethod, ServerNotification};
 use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, ClipboardEntry, Context, Entity, ExternalPaths, ImageFormat,
-    KeyBinding, Menu, MenuItem, Render, ScrollHandle, Subscription, Window, WindowBounds,
-    WindowOptions, actions, div, img, px, size,
+    Animation, AnimationExt as _, App, Application, Bounds, ClipboardEntry, Context, Entity,
+    ExternalPaths, ImageFormat, KeyBinding, Menu, MenuItem, Render, ScrollHandle, Subscription,
+    Transformation, Window, WindowBounds, WindowOptions, actions, div, img, percentage, px, size,
 };
 use gpui_component::Root;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -35,8 +35,8 @@ use gpui_component_assets::Assets;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sidebar::{
-    Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem,
-    SidebarToggleButton,
+    AnySidebarItem, Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu,
+    SidebarMenuItem, SidebarToggleButton,
 };
 use theme::Theme as AppTheme;
 
@@ -83,8 +83,6 @@ struct ThreadRow {
     updated_at: Option<u64>,
     #[serde(default)]
     cwd: String,
-    #[serde(default)]
-    path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,7 +99,6 @@ struct ThreadListItem {
     created_at: Option<u64>,
     updated_at: Option<u64>,
     cwd: Option<String>,
-    path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -324,13 +321,6 @@ fn input_position_for_offset(text: &str, offset: usize) -> Position {
     Position::new(line, character)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ThreadCache {
-    saved_at: u64,
-    cwd: String,
-    threads: Vec<ThreadRow>,
-}
-
 #[derive(Debug, Clone)]
 struct WorkspaceGroup {
     cwd: String,
@@ -401,6 +391,19 @@ struct ApprovalOption {
     response_payload: Value,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RateLimitEntry {
+    used_percent: f64,
+    window_duration_mins: u64,
+    resets_at: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RateLimits {
+    primary: Option<RateLimitEntry>,
+    secondary: Option<RateLimitEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct PendingApprovalRequest {
     request_id: Value,
@@ -418,6 +421,7 @@ struct AppShell {
     is_authenticated: bool,
     account_email: Option<String>,
     account_plan_type: Option<String>,
+    rate_limits: Option<RateLimits>,
     auth_error: Option<String>,
     login_in_progress: bool,
     logout_in_progress: bool,
@@ -427,11 +431,8 @@ struct AppShell {
     sidebar_collapsed: bool,
     thread_error: Option<String>,
     cwd: String,
-    cache_path: PathBuf,
-    raw_cache_path: PathBuf,
-    thread_content_cache_path: PathBuf,
-    thread_resume_content_cache_path: PathBuf,
     threads: Vec<ThreadRow>,
+    known_workspace_cwds: HashSet<String>,
     expanded_workspace_groups: HashSet<String>,
     expanded_workspace_threads: HashSet<String>,
     selected_thread_id: Option<String>,
@@ -491,16 +492,10 @@ impl AppShell {
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let cwd = Self::current_cwd();
-        let cache_path = Self::thread_cache_path(&cwd);
-        let raw_cache_path = Self::raw_thread_cache_path(&cwd);
-        let thread_content_cache_path = Self::thread_content_cache_path(&cwd);
-        let thread_resume_content_cache_path = Self::thread_resume_content_cache_path(&cwd);
-        let mut expanded_workspace_groups = HashSet::new();
-        expanded_workspace_groups.insert(cwd.clone());
-        let (threads, thread_error) = match Self::read_threads_cache(&cache_path) {
-            Ok(rows) => (rows, None),
-            Err(error) => (Vec::new(), Some(format!("cache read failed: {error}"))),
-        };
+        let expanded_workspace_groups = HashSet::new();
+        let threads = Vec::new();
+        let thread_error = None;
+        let known_workspace_cwds = HashSet::new();
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
@@ -532,6 +527,7 @@ impl AppShell {
             is_authenticated: false,
             account_email: None,
             account_plan_type: None,
+            rate_limits: None,
             auth_error: None,
             login_in_progress: false,
             logout_in_progress: false,
@@ -541,11 +537,8 @@ impl AppShell {
             sidebar_collapsed: false,
             thread_error,
             cwd: cwd.clone(),
-            cache_path,
-            raw_cache_path,
-            thread_content_cache_path,
-            thread_resume_content_cache_path,
             threads,
+            known_workspace_cwds,
             expanded_workspace_groups,
             expanded_workspace_threads: HashSet::new(),
             selected_thread_id: None,
@@ -1433,93 +1426,10 @@ impl AppShell {
         format!("{}d", delta / 86_400)
     }
 
-    fn unix_now() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0)
-    }
-
-    fn thread_cache_path(cwd: &str) -> PathBuf {
-        PathBuf::from(cwd).join(".agent-hub-threads.json")
-    }
-
-    fn raw_thread_cache_path(cwd: &str) -> PathBuf {
-        PathBuf::from(cwd).join(".agent-hub-threads-raw.json")
-    }
-
-    fn thread_content_cache_path(cwd: &str) -> PathBuf {
-        PathBuf::from(cwd).join(".agent-hub-thread-content.json")
-    }
-
-    fn thread_resume_content_cache_path(cwd: &str) -> PathBuf {
-        PathBuf::from(cwd).join(".agent-hub-thread-resume-content.json")
-    }
-
-    fn write_thread_content_cache(path: &Path, value: &Value) -> Result<(), String> {
-        let text = serde_json::to_string_pretty(&value)
-            .map_err(|serialize_error| format!("serialize failed: {serialize_error}"))?;
-        fs::write(path, text).map_err(|write_error| write_error.to_string())
-    }
-
-    fn app_server_error_as_json(error: &AppServerError) -> Value {
-        match error {
-            AppServerError::Rpc(rpc_error) => json!({
-                "type": "rpc",
-                "code": rpc_error.code,
-                "message": rpc_error.message,
-                "data": rpc_error.data
-            }),
-            AppServerError::Io(io_error) => json!({
-                "type": "io",
-                "message": io_error.to_string()
-            }),
-            AppServerError::Json(json_error) => json!({
-                "type": "json",
-                "message": json_error.to_string()
-            }),
-            AppServerError::Disconnected => json!({
-                "type": "disconnected",
-                "message": "app-server disconnected"
-            }),
-        }
-    }
-
-    fn read_threads_cache(path: &Path) -> Result<Vec<ThreadRow>, String> {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.to_string()),
-        };
-
-        let cache: ThreadCache =
-            serde_json::from_str(&text).map_err(|error| format!("invalid json: {error}"))?;
-        Ok(cache.threads)
-    }
-
-    fn write_threads_cache(path: &Path, cwd: &str, threads: &[ThreadRow]) -> Result<(), String> {
-        let cache = ThreadCache {
-            saved_at: Self::unix_now(),
-            cwd: cwd.to_string(),
-            threads: threads.to_vec(),
-        };
-        let text = serde_json::to_string_pretty(&cache)
-            .map_err(|error| format!("serialize failed: {error}"))?;
-        fs::write(path, text).map_err(|error| error.to_string())
-    }
-
-    fn write_raw_threads_cache(path: &Path, cwd: &str, payload: &Value) -> Result<(), String> {
-        let value = json!({
-            "saved_at": Self::unix_now(),
-            "cwd": cwd,
-            "thread_list_response": payload
-        });
-        let text = serde_json::to_string_pretty(&value)
-            .map_err(|error| format!("serialize failed: {error}"))?;
-        fs::write(path, text).map_err(|error| error.to_string())
-    }
-
-    fn group_threads_by_workspace(threads: &[ThreadRow], current_cwd: &str) -> Vec<WorkspaceGroup> {
+    fn group_threads_by_workspace(
+        threads: &[ThreadRow],
+        known_workspace_cwds: &HashSet<String>,
+    ) -> Vec<WorkspaceGroup> {
         let mut buckets: HashMap<String, Vec<ThreadRow>> = HashMap::new();
         for row in threads.iter().cloned() {
             let key = if row.cwd.is_empty() {
@@ -1528,6 +1438,12 @@ impl AppShell {
                 row.cwd.clone()
             };
             buckets.entry(key).or_default().push(row);
+        }
+        for workspace_cwd in known_workspace_cwds {
+            if workspace_cwd.trim().is_empty() {
+                continue;
+            }
+            buckets.entry(workspace_cwd.clone()).or_default();
         }
 
         let mut groups = buckets
@@ -1545,11 +1461,8 @@ impl AppShell {
             .collect::<Vec<_>>();
 
         groups.sort_by(|a, b| {
-            let a_current = a.cwd == current_cwd;
-            let b_current = b.cwd == current_cwd;
-            b_current
-                .cmp(&a_current)
-                .then_with(|| b.latest_ts.cmp(&a.latest_ts))
+            b.latest_ts
+                .cmp(&a.latest_ts)
                 .then_with(|| a.name.cmp(&b.name))
         });
         groups
@@ -1570,7 +1483,6 @@ impl AppShell {
                     id,
                     updated_at: timestamp,
                     cwd: entry.cwd.unwrap_or_else(|| cwd.to_string()),
-                    path: entry.path.filter(|path| !path.is_empty()),
                 }
             })
             .collect::<Vec<_>>();
@@ -1594,8 +1506,7 @@ impl AppShell {
 
         threads
             .iter()
-            .find(|row| row.cwd == cwd && row.path.is_some())
-            .or_else(|| threads.iter().find(|row| row.path.is_some()))
+            .find(|row| row.cwd == cwd)
             .or_else(|| threads.first())
             .cloned()
     }
@@ -1802,60 +1713,6 @@ impl AppShell {
             },
             cx,
         );
-    }
-
-    fn renderable_messages_from_session(path: &Path) -> Result<Vec<RenderableMessage>, String> {
-        let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
-        let mut messages = Vec::new();
-        let mut used_chars = 0usize;
-        let mut was_truncated = false;
-
-        for line in text.lines() {
-            let value: Value = match serde_json::from_str(line) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            if value.get("type").and_then(Value::as_str) != Some("event_msg") {
-                continue;
-            }
-
-            let payload = match value.get("payload") {
-                Some(payload) => payload,
-                None => continue,
-            };
-            let speaker = match payload.get("type").and_then(Value::as_str) {
-                Some("user_message") => ThreadSpeaker::User,
-                Some("agent_message") => ThreadSpeaker::Assistant,
-                _ => continue,
-            };
-            let Some(message) = payload.get("message").and_then(Value::as_str) else {
-                continue;
-            };
-            Self::push_renderable_item_with_budget(
-                &mut messages,
-                RenderableMessage::Text {
-                    speaker,
-                    content: message.to_string(),
-                    image_refs: Vec::new(),
-                },
-                &mut used_chars,
-                &mut was_truncated,
-            );
-
-            if was_truncated {
-                break;
-            }
-        }
-
-        if was_truncated {
-            messages.push(RenderableMessage::Text {
-                speaker: ThreadSpeaker::Assistant,
-                content: "_Thread content truncated for performance._".to_string(),
-                image_refs: Vec::new(),
-            });
-        }
-
-        Ok(messages)
     }
 
     fn budgeted_content(
@@ -2367,8 +2224,6 @@ impl AppShell {
         }
 
         self.loading_selected_thread = true;
-        let thread_content_cache_path = self.thread_content_cache_path.clone();
-        let thread_resume_content_cache_path = self.thread_resume_content_cache_path.clone();
         cx.notify();
 
         cx.spawn(async move |view, cx| {
@@ -2390,49 +2245,22 @@ impl AppShell {
                 }
 
                 match response {
-                    Ok(payload) => {
-                        let _ =
-                            Self::write_thread_content_cache(&thread_content_cache_path, &payload);
-                        let _ = Self::write_thread_content_cache(
-                            &thread_resume_content_cache_path,
-                            &payload,
-                        );
-                        match Self::renderable_messages_from_thread_response(&payload) {
-                            Ok(raw) => {
-                                view.selected_thread_messages =
-                                    Self::build_messages_from_raw(raw, cx);
-                                view.selected_thread_error = None;
-                                view.selected_thread_loaded_from_api_id =
-                                    Some(selected_thread_id.clone());
-                            }
-                            Err(error) => {
-                                view.selected_thread_error = Some(format!(
-                                    "failed to parse thread/resume response: {error}"
-                                ));
-                                view.selected_thread_loaded_from_api_id =
-                                    Some(selected_thread_id.clone());
-                            }
+                    Ok(payload) => match Self::renderable_messages_from_thread_response(&payload) {
+                        Ok(raw) => {
+                            view.selected_thread_messages = Self::build_messages_from_raw(raw, cx);
+                            view.selected_thread_error = None;
+                            view.selected_thread_loaded_from_api_id =
+                                Some(selected_thread_id.clone());
                         }
-                    }
+                        Err(error) => {
+                            view.selected_thread_error =
+                                Some(format!("failed to parse thread/resume response: {error}"));
+                            view.selected_thread_loaded_from_api_id =
+                                Some(selected_thread_id.clone());
+                        }
+                    },
                     Err(error) => {
                         view.selected_thread_error = Some(format!("thread/resume failed: {error}"));
-                        let raw_error = json!({
-                            "error": Self::app_server_error_as_json(&error),
-                            "request": {
-                                "method": "thread/resume",
-                                "params": {
-                                    "threadId": selected_thread_id
-                                }
-                            }
-                        });
-                        let _ = Self::write_thread_content_cache(
-                            &thread_content_cache_path,
-                            &raw_error,
-                        );
-                        let _ = Self::write_thread_content_cache(
-                            &thread_resume_content_cache_path,
-                            &raw_error,
-                        );
                     }
                 }
 
@@ -2483,26 +2311,9 @@ impl AppShell {
         self.loading_selected_thread = false;
         self.streaming_message_ix = None;
 
-        let Some(path) = row.path.as_deref() else {
-            self.selected_thread_messages.clear();
-            self.reset_live_tool_message_state();
-            self.selected_thread_error = Some("thread log path is unavailable".to_string());
-            self.ensure_composer_options_for_active_workspace(cx);
-            return;
-        };
-
-        match Self::renderable_messages_from_session(Path::new(path)) {
-            Ok(raw) => {
-                self.selected_thread_messages = Self::build_messages_from_raw(raw, cx);
-                self.reset_live_tool_message_state();
-                self.selected_thread_error = None;
-            }
-            Err(error) => {
-                self.selected_thread_messages.clear();
-                self.reset_live_tool_message_state();
-                self.selected_thread_error = Some(format!("failed to load session: {error}"));
-            }
-        }
+        self.selected_thread_messages.clear();
+        self.reset_live_tool_message_state();
+        self.selected_thread_error = None;
         self.ensure_composer_options_for_active_workspace(cx);
     }
 
@@ -2949,6 +2760,7 @@ impl AppShell {
 
     fn start_new_thread_in_workspace(&mut self, workspace_cwd: String, cx: &mut Context<Self>) {
         self.expanded_workspace_groups.insert(workspace_cwd.clone());
+        self.known_workspace_cwds.insert(workspace_cwd.clone());
         self.selected_thread_error = None;
         self.selected_thread_id = None;
         self.selected_thread_messages.clear();
@@ -2963,10 +2775,42 @@ impl AppShell {
         cx.notify();
     }
 
+    fn add_workspace(&mut self, workspace_cwd: String, cx: &mut Context<Self>) {
+        let workspace_cwd = workspace_cwd.trim().to_string();
+        if workspace_cwd.is_empty() {
+            return;
+        }
+
+        self.known_workspace_cwds.insert(workspace_cwd.clone());
+        self.expanded_workspace_groups.insert(workspace_cwd.clone());
+        self.ensure_composer_options_for_cwd(workspace_cwd, cx);
+        cx.notify();
+    }
+
+    fn prompt_add_workspace(&mut self, cx: &mut Context<Self>) {
+        let paths_rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |view, cx| {
+            if let Ok(Ok(Some(selected))) = paths_rx.await
+                && let Some(path) = selected.first()
+            {
+                let workspace_cwd = path.to_string_lossy().to_string();
+                let _ = view.update(cx, |view, cx| {
+                    view.add_workspace(workspace_cwd.clone(), cx);
+                });
+            }
+        })
+        .detach();
+    }
+
     fn clear_workspace_state(&mut self) {
         self.threads.clear();
+        self.known_workspace_cwds.clear();
         self.expanded_workspace_groups.clear();
-        self.expanded_workspace_groups.insert(self.cwd.clone());
         self.expanded_workspace_threads.clear();
         self.selected_thread_id = None;
         self.selected_thread_title = None;
@@ -3028,8 +2872,6 @@ impl AppShell {
 
         self.loading_threads = true;
         let cwd = self.cwd.clone();
-        let cache_path = self.cache_path.clone();
-        let raw_cache_path = self.raw_cache_path.clone();
         cx.notify();
 
         cx.spawn(async move |view, cx| {
@@ -3043,19 +2885,14 @@ impl AppShell {
                         Ok(rows) => {
                             view.thread_error = None;
                             view.threads = rows;
+                            view.known_workspace_cwds.insert(cwd.clone());
+                            for thread in &view.threads {
+                                if !thread.cwd.trim().is_empty() {
+                                    view.known_workspace_cwds.insert(thread.cwd.clone());
+                                }
+                            }
                             view.refresh_selected_thread(cx);
                             view.maybe_fetch_selected_thread_from_api(cx);
-                            if let Err(error) =
-                                Self::write_threads_cache(&cache_path, &cwd, &view.threads)
-                            {
-                                view.thread_error = Some(format!("cache write failed: {error}"));
-                            }
-                            if let Err(error) =
-                                Self::write_raw_threads_cache(&raw_cache_path, &cwd, &payload)
-                            {
-                                view.thread_error =
-                                    Some(format!("raw cache write failed: {error}"));
-                            }
                         }
                         Err(error) => {
                             view.thread_error = Some(error);
@@ -3093,6 +2930,7 @@ impl AppShell {
                                 view.load_threads_from_server(Arc::clone(&server), cx);
                             }
                             view.load_model_and_reasoning_options(Arc::clone(&server), cx);
+                            view.fetch_rate_limits(Arc::clone(&server), cx);
                         } else {
                             view.ensure_composer_options_for_active_workspace(cx);
                         }
@@ -3102,6 +2940,39 @@ impl AppShell {
                     }
                 }
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn parse_rate_limit_entry(value: &Value) -> Option<RateLimitEntry> {
+        Some(RateLimitEntry {
+            used_percent: value.get("usedPercent").and_then(Value::as_f64)?,
+            window_duration_mins: value.get("windowDurationMins").and_then(Value::as_u64)?,
+            resets_at: value.get("resetsAt").and_then(Value::as_u64)?,
+        })
+    }
+
+    fn parse_rate_limits(payload: &Value) -> RateLimits {
+        let limits = payload.get("rateLimits").unwrap_or(payload);
+        RateLimits {
+            primary: limits.get("primary").and_then(Self::parse_rate_limit_entry),
+            secondary: limits
+                .get("secondary")
+                .and_then(Self::parse_rate_limit_entry),
+        }
+    }
+
+    fn fetch_rate_limits(&mut self, server: Arc<AppServer>, cx: &mut Context<Self>) {
+        cx.spawn(async move |view, cx| {
+            let response = server
+                .call(RequestMethod::AccountRateLimitsRead, json!({}))
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if let Ok(payload) = response {
+                    view.rate_limits = Some(Self::parse_rate_limits(&payload));
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -3223,9 +3094,6 @@ impl AppShell {
 
         self.started = true;
         self.loading_auth_state = true;
-        if let Err(error) = Self::write_threads_cache(&self.cache_path, &self.cwd, &self.threads) {
-            self.thread_error = Some(format!("cache write failed: {error}"));
-        }
         cx.notify();
 
         cx.spawn(async move |view, cx| {
@@ -3424,6 +3292,7 @@ impl AppShell {
                     self.is_authenticated = false;
                     self.account_email = None;
                     self.account_plan_type = None;
+                    self.rate_limits = None;
                     self.login_url = None;
                     self.pending_login_id = None;
                     self.login_in_progress = false;
@@ -3433,8 +3302,112 @@ impl AppShell {
                     self.refresh_account_state(server, true, cx);
                 }
             }
+            "account/rateLimits/updated" => {
+                self.rate_limits = Some(Self::parse_rate_limits(&notification.params));
+            }
             _ => {}
         }
+    }
+
+    fn format_window_label(window_mins: u64) -> String {
+        if window_mins >= 1440 {
+            let days = window_mins / 1440;
+            format!("{days}d")
+        } else if window_mins >= 60 {
+            let hours = window_mins / 60;
+            format!("{hours}h")
+        } else {
+            format!("{window_mins}m")
+        }
+    }
+
+    fn format_resets_at(resets_at: u64) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if resets_at <= now {
+            return "now".to_string();
+        }
+        let diff = resets_at - now;
+        if diff < 3600 {
+            let mins = diff / 60;
+            format!("{mins}m")
+        } else if diff < 86400 {
+            let hours = diff / 3600;
+            let mins = (diff % 3600) / 60;
+            if mins > 0 {
+                format!("{hours}h {mins}m")
+            } else {
+                format!("{hours}h")
+            }
+        } else {
+            let days = diff / 86400;
+            format!("{days}d")
+        }
+    }
+
+    fn render_rate_limit_bar(
+        label: &str,
+        entry: &RateLimitEntry,
+        bar_fill_color: gpui::Hsla,
+        bar_track_color: gpui::Hsla,
+        subtext_color: gpui::Hsla,
+    ) -> gpui::AnyElement {
+        let used = entry.used_percent.clamp(0.0, 100.0);
+        let remaining = 100.0 - used;
+        let resets_label = Self::format_resets_at(entry.resets_at);
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(subtext_color)
+                            .child(format!("{label} limit")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(subtext_color)
+                            .child(format!("{remaining:.0}% left · resets {resets_label}")),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .h(px(6.))
+                    .rounded(px(3.))
+                    .bg(bar_track_color)
+                    .overflow_hidden()
+                    .flex()
+                    .child(
+                        div()
+                            .h_full()
+                            .rounded(px(3.))
+                            .bg(bar_fill_color)
+                            .flex_shrink_0()
+                            .flex_grow()
+                            .flex_basis(gpui::relative(remaining as f32 / 100.0)),
+                    )
+                    .child(
+                        div()
+                            .h_full()
+                            .flex_shrink_0()
+                            .flex_grow()
+                            .flex_basis(gpui::relative(used as f32 / 100.0)),
+                    ),
+            )
+            .into_any_element()
     }
 
     const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "ico"];
@@ -3511,6 +3484,76 @@ impl AppShell {
             .and_then(|name| name.to_str())
             .map(str::to_owned)
             .unwrap_or_else(|| "image".to_string())
+    }
+
+    fn local_image_dimensions(path_or_url: &str) -> Option<(f32, f32)> {
+        let path = Path::new(path_or_url);
+        if !path.is_absolute() {
+            return None;
+        }
+
+        let Ok(dimensions) = imagesize::size(path) else {
+            return None;
+        };
+        if dimensions.width == 0 || dimensions.height == 0 {
+            return None;
+        }
+
+        Some((dimensions.width as f32, dimensions.height as f32))
+    }
+
+    fn fit_size_to_bounds(width: f32, height: f32, max_width: f32, max_height: f32) -> (f32, f32) {
+        if width <= 0. || height <= 0. {
+            return (max_width, max_height);
+        }
+
+        let scale = (max_width / width).min(max_height / height).min(1.);
+        ((width * scale).max(1.), (height * scale).max(1.))
+    }
+
+    fn message_image_preview_size(image_ref: &str, image_count: usize) -> (f32, f32) {
+        let (default_width, default_height) = if image_count <= 1 {
+            (360., 220.)
+        } else {
+            (220., 160.)
+        };
+
+        let Some((width, height)) = Self::local_image_dimensions(image_ref) else {
+            return (default_width, default_height);
+        };
+
+        let aspect_ratio = width / height;
+        let (max_width, max_height) = if image_count <= 1 {
+            if aspect_ratio >= 2. {
+                (620., 260.)
+            } else if aspect_ratio <= 0.75 {
+                (300., 460.)
+            } else {
+                (460., 320.)
+            }
+        } else if aspect_ratio >= 2. {
+            (360., 170.)
+        } else if aspect_ratio <= 0.75 {
+            (170., 280.)
+        } else {
+            (220., 170.)
+        };
+
+        Self::fit_size_to_bounds(width, height, max_width, max_height)
+    }
+
+    fn composer_attachment_preview_size(image_ref: &str, attachment_count: usize) -> (f32, f32) {
+        let (default_width, default_height, max_width, max_height) = if attachment_count <= 1 {
+            (150., 96., 220., 140.)
+        } else {
+            (110., 72., 150., 96.)
+        };
+
+        let Some((width, height)) = Self::local_image_dimensions(image_ref) else {
+            return (default_width, default_height);
+        };
+
+        Self::fit_size_to_bounds(width, height, max_width, max_height)
     }
 
     fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3703,7 +3746,8 @@ impl Render for AppShell {
             self.maybe_fetch_selected_thread_from_api(cx);
         }
 
-        let workspace_groups = Self::group_threads_by_workspace(&self.threads, &self.cwd);
+        let workspace_groups =
+            Self::group_threads_by_workspace(&self.threads, &self.known_workspace_cwds);
         let this = cx.entity().downgrade();
         let selected_id = self.selected_thread_id.clone();
         let skill_picker = self.current_skill_picker_state(cx);
@@ -3720,10 +3764,12 @@ impl Render for AppShell {
             self.file_picker_selected_ix
                 .min(picker.items.len().saturating_sub(1))
         });
+        let waiting_for_response = self.selected_thread_is_busy();
+        let show_streaming_status = waiting_for_response && !self.has_pending_approval();
         let has_input = !self.input_state.read(cx).value().trim().is_empty()
             || !self.attached_images.is_empty();
         let can_send = has_input
-            && !self.selected_thread_is_busy()
+            && !waiting_for_response
             && !self.has_pending_approval()
             && self.is_authenticated
             && self._app_server.is_some();
@@ -3746,20 +3792,13 @@ impl Render for AppShell {
                     .icon(IconName::LoaderCircle)
                     .disable(true),
             ]
-        } else if self.threads.is_empty() {
-            if let Some(error) = &self.thread_error {
-                vec![
-                    SidebarMenuItem::new(Self::truncate(&format!("Failed to load: {error}"), 40))
-                        .icon(IconName::TriangleAlert)
-                        .disable(true),
-                ]
-            } else {
-                vec![
-                    SidebarMenuItem::new("No threads yet")
-                        .icon(IconName::Inbox)
-                        .disable(true),
-                ]
-            }
+        } else if self.threads.is_empty() && self.thread_error.is_some() {
+            let error = self.thread_error.clone().unwrap_or_default();
+            vec![
+                SidebarMenuItem::new(Self::truncate(&format!("Failed to load: {error}"), 40))
+                    .icon(IconName::TriangleAlert)
+                    .disable(true),
+            ]
         } else {
             let mut items = Vec::new();
             for group in &workspace_groups {
@@ -3842,7 +3881,7 @@ impl Render for AppShell {
                         } else {
                             IconName::FolderClosed
                         })
-                        .active(group.cwd == self.cwd)
+                        .active(false)
                         .default_open(is_workspace_open)
                         .click_to_open(true)
                         .show_caret(false)
@@ -3893,7 +3932,15 @@ impl Render for AppShell {
                         .children(children),
                 );
             }
-            items
+            if items.is_empty() {
+                vec![
+                    SidebarMenuItem::new("No workspaces yet")
+                        .icon(IconName::Inbox)
+                        .disable(true),
+                ]
+            } else {
+                items
+            }
         };
 
         let app_theme = cx.global::<AppTheme>();
@@ -3930,13 +3977,17 @@ impl Render for AppShell {
                 "Continue with ChatGPT"
             };
             let login_status = if self.loading_auth_state {
-                "Checking your account..."
+                "Checking your account...".to_string()
             } else if self.login_in_progress {
-                "Waiting for login confirmation..."
+                "Waiting for login confirmation...".to_string()
             } else if self._app_server.is_none() {
-                "Connecting to Codex app-server..."
+                if let Some(error) = &self.thread_error {
+                    format!("Connection error: {}", error)
+                } else {
+                    "Connecting to Codex app-server...".to_string()
+                }
             } else {
-                "Log in to Agent Hub to view and use workspaces."
+                "Log in to Agent Hub to view and use workspaces.".to_string()
             };
             let show_login_url = self.login_url.is_some();
             let auth_error = self.auth_error.clone().unwrap_or_default();
@@ -3966,8 +4017,7 @@ impl Render for AppShell {
                         .h(px(74.))
                         .flex()
                         .items_center()
-                        .justify_center()
-                        .child(div().text_lg().text_color(hero_subtext).child("Agent Hub")),
+                        .justify_center(),
                 )
                 .child(
                     div()
@@ -4146,115 +4196,166 @@ impl Render for AppShell {
                     }
                 }
             }))
+            .capture_action(cx.listener(|view, _: &NewWorkspace, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+                view.prompt_add_workspace(cx);
+            }))
             .child(
-                Sidebar::new("sidebar")
+                Sidebar::<AnySidebarItem>::new("sidebar")
                     .w(px(300.))
                     .collapsed(self.sidebar_collapsed)
-                    .header(
-                        SidebarHeader::new().child(
-                            div()
-                                .w_full()
-                                .pt(px(6.))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(8.))
-                                        .when(!self.sidebar_collapsed, |this| {
-                                            this.child("Agent Hub")
-                                        }),
-                                )
-                                .child(
-                                    SidebarToggleButton::new()
-                                        .collapsed(self.sidebar_collapsed)
-                                        .on_click({
-                                            let this = this.clone();
-                                            move |_, _, cx| {
-                                                let _ = this.update(cx, |view, cx| {
-                                                    view.sidebar_collapsed =
-                                                        !view.sidebar_collapsed;
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }),
-                                ),
-                        ),
-                    )
+                    .header(SidebarHeader::new())
                     .child(
-                        SidebarGroup::new("Main").child(
-                            SidebarMenu::new()
-                                .child(
-                                    SidebarMenuItem::new("New thread")
-                                        .icon(IconName::Plus)
-                                        .on_click({
-                                            let this = this.clone();
-                                            move |_, _, cx| {
-                                                let _ = this.update(cx, |view, cx| {
-                                                    let workspace_cwd = view.active_composer_cwd();
-                                                    view.start_new_thread_in_workspace(
-                                                        workspace_cwd,
-                                                        cx,
-                                                    );
-                                                });
-                                            }
-                                        }),
-                                )
-                                .child(SidebarMenuItem::new("Automations").icon(IconName::Bell))
-                                .child(SidebarMenuItem::new("Skills").icon(IconName::BookOpen)),
-                        ),
-                    )
-                    .child(
-                        SidebarGroup::new("Workspaces")
-                            .child(SidebarMenu::new().children(thread_workspace_items)),
-                    )
-                    .footer(
-                        SidebarFooter::new()
+                        SidebarMenu::new()
                             .child(
-                                div()
-                                    .w_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.))
-                                            .child(Icon::new(IconName::Settings))
-                                            .when(!self.sidebar_collapsed, |this| {
-                                                this.child("Settings")
-                                            }),
-                                    )
-                                    .when(!self.sidebar_collapsed, |this| {
-                                        this.child(Icon::new(IconName::ChevronUp).size(px(14.)))
-                                    }),
-                            )
-                            .dropdown_menu_with_anchor(gpui::Corner::TopLeft, {
-                                let this = this.clone();
-                                let logout_in_progress = self.logout_in_progress;
-                                move |menu: PopupMenu,
-                                      _window: &mut Window,
-                                      _cx: &mut gpui::Context<PopupMenu>| {
-                                    if logout_in_progress {
-                                        return menu.label("Logging out...");
-                                    }
-
-                                    menu.item(PopupMenuItem::new("Logout").on_click({
+                                SidebarMenuItem::new("New thread")
+                                    .icon(IconName::Plus)
+                                    .on_click({
                                         let this = this.clone();
                                         move |_, _, cx| {
                                             let _ = this.update(cx, |view, cx| {
-                                                view.start_logout(cx);
+                                                let workspace_cwd = view.active_composer_cwd();
+                                                view.start_new_thread_in_workspace(
+                                                    workspace_cwd,
+                                                    cx,
+                                                );
                                             });
                                         }
-                                    }))
+                                    }),
+                            )
+                    )
+                    .child(
+                        SidebarGroup::new("Workspaces")
+                            .suffix({
+                                let this = this.clone();
+                                move |_, _| {
+                                    Button::new("workspaces-add-workspace")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Folder)
+                                        .tooltip("Add workspace")
+                                        .on_click({
+                                            let this = this.clone();
+                                            move |_, _: &mut Window, cx: &mut App| {
+                                                cx.stop_propagation();
+                                                let _ = this.update(cx, |view, cx| {
+                                                    view.prompt_add_workspace(cx);
+                                                });
+                                            }
+                                        })
                                 }
-                            }),
-                    ),
+                            })
+                            .child(SidebarMenu::new().children(thread_workspace_items)),
+                    )
+                    .footer({
+                        let rate_limits = self.rate_limits.clone();
+                        let sidebar_collapsed = self.sidebar_collapsed;
+
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .when_some(
+                                if sidebar_collapsed { None } else { rate_limits },
+                                |this, limits| {
+                                    this.child(
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(8.))
+                                            .px(px(4.))
+                                            .py(px(8.))
+                                            .mb(px(4.))
+                                            .rounded(px(6.))
+                                            .border_1()
+                                            .border_color(surface0)
+                                            .bg(mantle)
+                                            .when_some(
+                                                limits.primary.as_ref(),
+                                                |this, entry| {
+                                                    let label = Self::format_window_label(
+                                                        entry.window_duration_mins,
+                                                    );
+                                                    this.child(Self::render_rate_limit_bar(
+                                                        &label,
+                                                        entry,
+                                                        overlay_color,
+                                                        surface0,
+                                                        subtext_color,
+                                                    ))
+                                                },
+                                            )
+                                            .when_some(
+                                                limits.secondary.as_ref(),
+                                                |this, entry| {
+                                                    let label = Self::format_window_label(
+                                                        entry.window_duration_mins,
+                                                    );
+                                                    this.child(Self::render_rate_limit_bar(
+                                                        &label,
+                                                        entry,
+                                                        overlay_color,
+                                                        surface0,
+                                                        subtext_color,
+                                                    ))
+                                                },
+                                            ),
+                                    )
+                                },
+                            )
+                            .child(
+                                SidebarFooter::new()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(8.))
+                                                    .child(Icon::new(IconName::Settings))
+                                                    .when(!sidebar_collapsed, |this| {
+                                                        this.child("Settings")
+                                                    }),
+                                            )
+                                            .when(!sidebar_collapsed, |this| {
+                                                this.child(
+                                                    Icon::new(IconName::ChevronUp).size(px(14.)),
+                                                )
+                                            }),
+                                    )
+                                    .dropdown_menu_with_anchor(gpui::Corner::TopLeft, {
+                                        let this = this.clone();
+                                        let logout_in_progress = self.logout_in_progress;
+                                        move |menu: PopupMenu,
+                                              _window: &mut Window,
+                                              _cx: &mut gpui::Context<PopupMenu>| {
+                                            if logout_in_progress {
+                                                return menu.label("Logging out...");
+                                            }
+
+                                            menu.item(PopupMenuItem::new("Logout").on_click({
+                                                let this = this.clone();
+                                                move |_, _, cx| {
+                                                    let _ = this.update(cx, |view, cx| {
+                                                        view.start_logout(cx);
+                                                    });
+                                                }
+                                            }))
+                                        }
+                                    }),
+                            )
+                    }),
             )
-            .child(div().w(px(1.)).h_full().bg(divider_color))
+            .when(!self.sidebar_collapsed, |this| {
+                this.child(div().w(px(1.)).h_full().bg(divider_color))
+            })
             .child(
                 div()
                     .flex_1()
@@ -4265,17 +4366,43 @@ impl Render for AppShell {
                     .child(
                         div()
                             .w_full()
-                            .h(px(44.))
+                            .h(px(52.))
                             .px(px(16.))
                             .flex()
                             .items_center()
-                            .text_sm()
-                            .text_color(text_color)
-                            .child(
-                                self.selected_thread_title
-                                    .clone()
-                                    .unwrap_or_else(|| "Thread".to_string()),
-                            ),
+                            .justify_between()
+                            .child({
+                                let sidebar_collapsed = self.sidebar_collapsed;
+                                let entity = this.clone();
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .when(sidebar_collapsed, |this| {
+                                        this.pl(px(80.))
+                                    })
+                                    .child(
+                                        SidebarToggleButton::new()
+                                            .collapsed(sidebar_collapsed)
+                                            .on_click(move |_, _, cx| {
+                                                let _ = entity.update(cx, |view, cx| {
+                                                    view.sidebar_collapsed =
+                                                        !view.sidebar_collapsed;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(text_color)
+                                            .child(
+                                                self.selected_thread_title
+                                                    .clone()
+                                                    .unwrap_or_else(|| "Thread".to_string()),
+                                            ),
+                                    )
+                            }),
                     )
                     .child(div().w_full().h(px(1.)).bg(divider_color))
                     .child(
@@ -4295,7 +4422,7 @@ impl Render for AppShell {
                                         div().w_full().flex().justify_center().child(
                                             div()
                                                 .w_full()
-                                                .max_w(px(920.))
+                                                .max_w(px(930.))
                                                 .py(px(18.))
                                                 .child(if !self.selected_thread_messages.is_empty() {
                                                     let chat_rows = self
@@ -4321,12 +4448,17 @@ impl Render for AppShell {
                                                                     .items_end()
                                                                     .gap(px(8.))
                                                                     .when(!image_refs.is_empty(), {
+                                                                        let image_count = image_refs.len();
                                                                         let image_refs = image_refs;
                                                                         move |this| {
                                                                             this.child(
                                                                                 div()
                                                                                     .w_full()
-                                                                                    .max_w(px(390.))
+                                                                                    .max_w(px(if image_count <= 1 {
+                                                                                        620.
+                                                                                    } else {
+                                                                                        390.
+                                                                                    }))
                                                                                     .flex()
                                                                                     .flex_wrap()
                                                                                     .justify_end()
@@ -4336,6 +4468,10 @@ impl Render for AppShell {
                                                                                             .into_iter()
                                                                                             .map(
                                                                                                 |image_ref| {
+                                                                                                    let preview_size = AppShell::message_image_preview_size(
+                                                                                                        &image_ref,
+                                                                                                        image_count,
+                                                                                                    );
                                                                                                     let image = if Path::new(&image_ref)
                                                                                                         .is_absolute()
                                                                                                     {
@@ -4347,8 +4483,8 @@ impl Render for AppShell {
                                                                                                         img(image_ref)
                                                                                                     };
                                                                                                     div()
-                                                                                                        .w(px(124.))
-                                                                                                        .h(px(96.))
+                                                                                                        .w(px(preview_size.0))
+                                                                                                        .h(px(preview_size.1))
                                                                                                         .rounded(px(10.))
                                                                                                         .overflow_hidden()
                                                                                                         .border_1()
@@ -4358,7 +4494,7 @@ impl Render for AppShell {
                                                                                                             image
                                                                                                                 .size_full()
                                                                                                                 .object_fit(
-                                                                                                                    gpui::ObjectFit::Contain,
+                                                                                                                    gpui::ObjectFit::ScaleDown,
                                                                                                                 ),
                                                                                                         )
                                                                                                 },
@@ -4397,7 +4533,7 @@ impl Render for AppShell {
                                                                 .justify_start()
                                                                 .child(
                                                                     div()
-                                                                        .max_w(px(860.))
+                                                                        .max_w(px(930.))
                                                                         .text_color(text_color)
                                                                         .child(
                                                                             TextView::new(
@@ -4443,13 +4579,13 @@ impl Render for AppShell {
                                                                 let expanded = *expanded;
                                                                 div()
                                                                     .w_full()
-                                                                    .mb(px(16.))
+                                                                    .mb(px(10.))
                                                                     .flex()
                                                                     .justify_start()
                                                                     .child(
                                                                         div()
                                                                             .w_full()
-                                                                            .max_w(px(860.))
+                                                                            .max_w(px(930.))
                                                                             .child(
                                                                                 gpui_component::accordion::Accordion::new(
                                                                                     command_row_accordion_id,
@@ -4529,13 +4665,13 @@ impl Render for AppShell {
 
                                                                 div()
                                                                     .w_full()
-                                                                    .mb(px(16.))
+                                                                    .mb(px(10.))
                                                                     .flex()
                                                                     .justify_start()
                                                                     .child(
                                                                         div()
                                                                             .w_full()
-                                                                            .max_w(px(860.))
+                                                                            .max_w(px(930.))
                                                                             .child(
                                                                                 gpui_component::accordion::Accordion::new(
                                                                                     file_change_accordion_id,
@@ -4895,6 +5031,7 @@ impl Render for AppShell {
                                     )
                                     .when(!attached_images.is_empty(), {
                                         let this = this.clone();
+                                        let attachment_count = attached_images.len();
                                         move |el| {
                                             el.child(
                                                 div()
@@ -4916,6 +5053,13 @@ impl Render for AppShell {
                                                                         18,
                                                                     );
                                                                 let path_clone = path.clone();
+                                                                let image_ref =
+                                                                    path.to_string_lossy().to_string();
+                                                                let preview_size =
+                                                                    AppShell::composer_attachment_preview_size(
+                                                                        &image_ref,
+                                                                        attachment_count,
+                                                                    );
                                                                 let this = this.clone();
 
                                                                 div()
@@ -4932,11 +5076,20 @@ impl Render for AppShell {
                                                                     .border_color(surface1)
                                                                     .bg(surface0)
                                                                     .child(
-                                                                        img(path_clone)
-                                                                            .size(px(24.))
-                                                                            .rounded(px(4.))
-                                                                            .object_fit(
-                                                                                gpui::ObjectFit::Cover,
+                                                                        div()
+                                                                            .w(px(preview_size.0))
+                                                                            .h(px(preview_size.1))
+                                                                            .rounded(px(6.))
+                                                                            .overflow_hidden()
+                                                                            .border_1()
+                                                                            .border_color(surface1)
+                                                                            .bg(mantle)
+                                                                            .child(
+                                                                                img(path_clone)
+                                                                                    .size_full()
+                                                                                    .object_fit(
+                                                                                        gpui::ObjectFit::ScaleDown,
+                                                                                    ),
                                                                             ),
                                                                     )
                                                                     .child(
@@ -5265,6 +5418,40 @@ impl Render for AppShell {
                                                 ),
                                         )
                                     })
+                                    .when(show_streaming_status, |this| {
+                                        this.child(
+                                            div()
+                                                .w_full()
+                                                .px(px(4.))
+                                                .py(px(2.))
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(8.))
+                                                .child(
+                                                    Icon::new(IconName::LoaderCircle)
+                                                        .size(px(14.))
+                                                        .text_color(overlay_color)
+                                                        .with_animation(
+                                                            "composer-streaming-spinner",
+                                                            Animation::new(Duration::from_secs(1))
+                                                                .repeat(),
+                                                            |icon, delta| {
+                                                                icon.transform(
+                                                                    Transformation::rotate(
+                                                                        percentage(delta),
+                                                                    ),
+                                                                )
+                                                            },
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(subtext_color)
+                                                        .child("Streaming response ..."),
+                                                ),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .w_full()
@@ -5328,7 +5515,7 @@ impl Render for AppShell {
                                                     .h_full()
                                                     .text_color(text_color)
                                                     .disabled(
-                                                        self.selected_thread_is_busy()
+                                                        waiting_for_response
                                                             || self.has_pending_approval()
                                                             || self._app_server.is_none(),
                                                     ),
@@ -5888,5 +6075,38 @@ mod tests {
     fn image_ref_for_message_strips_file_scheme_from_local_file_urls() {
         let image_ref = AppShell::image_ref_for_message("file:///tmp/repo/screenshot.png");
         assert_eq!(image_ref, "/tmp/repo/screenshot.png");
+    }
+
+    #[test]
+    fn fit_size_to_bounds_scales_into_limits_without_changing_ratio() {
+        let (width, height) = AppShell::fit_size_to_bounds(2000., 1000., 620., 260.);
+        assert!((width - 520.).abs() < 0.01);
+        assert!((height - 260.).abs() < 0.01);
+    }
+
+    #[test]
+    fn message_image_preview_size_uses_safe_default_for_non_local_images() {
+        let (single_width, single_height) =
+            AppShell::message_image_preview_size("data:image/png;base64,AAA", 1);
+        assert!((single_width - 360.).abs() < 0.01);
+        assert!((single_height - 220.).abs() < 0.01);
+
+        let (multi_width, multi_height) =
+            AppShell::message_image_preview_size("https://example.com/image.png", 3);
+        assert!((multi_width - 220.).abs() < 0.01);
+        assert!((multi_height - 160.).abs() < 0.01);
+    }
+
+    #[test]
+    fn composer_attachment_preview_size_uses_safe_default_for_non_local_images() {
+        let (single_width, single_height) =
+            AppShell::composer_attachment_preview_size("https://example.com/image.png", 1);
+        assert!((single_width - 150.).abs() < 0.01);
+        assert!((single_height - 96.).abs() < 0.01);
+
+        let (multi_width, multi_height) =
+            AppShell::composer_attachment_preview_size("data:image/png;base64,AAA", 3);
+        assert!((multi_width - 110.).abs() < 0.01);
+        assert!((multi_height - 72.).abs() < 0.01);
     }
 }

@@ -40,6 +40,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "imagesize",
  "rust-embed",
  "serde",
  "serde_json",

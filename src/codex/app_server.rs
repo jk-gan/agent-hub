@@ -37,6 +37,8 @@ pub enum RequestMethod {
     SkillsList,
     #[serde(rename = "turn/start")]
     TurnStart,
+    #[serde(rename = "account/rateLimits/read")]
+    AccountRateLimitsRead,
 }
 
 impl RequestMethod {
@@ -53,6 +55,7 @@ impl RequestMethod {
             Self::ThreadResume => "thread/resume",
             Self::SkillsList => "skills/list",
             Self::TurnStart => "turn/start",
+            Self::AccountRateLimitsRead => "account/rateLimits/read",
         }
     }
 }
@@ -420,7 +423,8 @@ impl AppServer {
     }
 
     fn spawn() -> Result<Self, AppServerError> {
-        let mut child = Command::new("codex")
+        let codex_path = find_codex_executable();
+        let mut child = Command::new(codex_path)
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -484,15 +488,15 @@ impl AppServer {
                                 .as_deref()
                                 .unwrap_or(GLOBAL_THREAD_LOG_ID);
 
-                            if trace_entry.deferred_request_log {
-                                if let Err(error) = trace_logger_for_reader.log_request(
+                            if trace_entry.deferred_request_log
+                                && let Err(error) = trace_logger_for_reader.log_request(
                                     thread_log_id,
                                     response.id,
                                     &trace_entry.method,
                                     &trace_entry.request_raw,
-                                ) {
-                                    eprintln!("app-server: failed to write request trace: {error}");
-                                }
+                                )
+                            {
+                                eprintln!("app-server: failed to write request trace: {error}");
                             }
 
                             if let Err(error) = trace_logger_for_reader.log_response(
@@ -658,15 +662,14 @@ impl AppServer {
                 .lock()
                 .expect("pending traces lock poisoned")
                 .remove(&id)
+                && trace_entry.deferred_request_log
             {
-                if trace_entry.deferred_request_log {
-                    let _ = self.trace_logger.log_request(
-                        GLOBAL_THREAD_LOG_ID,
-                        id,
-                        &trace_entry.method,
-                        &trace_entry.request_raw,
-                    );
-                }
+                let _ = self.trace_logger.log_request(
+                    GLOBAL_THREAD_LOG_ID,
+                    id,
+                    &trace_entry.method,
+                    &trace_entry.request_raw,
+                );
             }
             return Err(AppServerError::Disconnected);
         }
@@ -717,6 +720,25 @@ impl AppServer {
             .try_send(line)
             .map_err(|_| AppServerError::Disconnected)
     }
+}
+
+fn find_codex_executable() -> PathBuf {
+    let mut paths = vec![
+        PathBuf::from("/opt/homebrew/bin/codex"),
+        PathBuf::from("/usr/local/bin/codex"),
+    ];
+
+    if let Ok(home) = std::env::var("HOME") {
+        paths.push(PathBuf::from(home).join(".cargo/bin/codex"));
+    }
+
+    for path in paths {
+        if path.exists() {
+            return path;
+        }
+    }
+
+    PathBuf::from("codex")
 }
 
 #[cfg(test)]
