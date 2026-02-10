@@ -31,7 +31,7 @@ use gpui_component::input::{
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
-use gpui_component::theme::{Theme as ComponentTheme, hsl};
+use gpui_component::theme::hsl;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_component_assets::Assets;
@@ -7237,23 +7237,7 @@ fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         gpui_component::init(cx);
         AppTheme::init(cx);
-        let app_theme = cx.global::<AppTheme>();
-        let is_dark = app_theme.mode.is_dark();
-        let text_color = app_theme.text;
-        let blue_color = app_theme.blue;
-        let surface1 = app_theme.surface1;
-        if is_dark {
-            ComponentTheme::change(gpui_component::theme::ThemeMode::Dark, None, cx);
-        }
-        let theme = ComponentTheme::global_mut(cx);
-        theme.foreground = text_color;
-        theme.caret = text_color;
-        theme.accent = surface1;
-        theme.accent_foreground = text_color;
-        theme.link = blue_color;
-        theme.link_hover = blue_color;
-        theme.font_size = px(15.);
-        theme.mono_font_size = px(12.);
+        AppTheme::apply_component_theme(cx);
 
         let bounds = Bounds::centered(None, size(px(1_520.), px(920.)), cx);
 
@@ -7272,6 +7256,12 @@ fn main() {
         };
 
         cx.open_window(window_options, |window, cx| {
+            window
+                .observe_window_appearance(|_, cx| {
+                    AppTheme::sync_system_appearance(cx);
+                })
+                .detach();
+
             let app_view = cx.new(|cx| AppShell::new(window, cx));
             cx.new(|cx| Root::new(app_view, window, cx))
         })

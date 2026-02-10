@@ -125,11 +125,37 @@ impl Theme {
         .into()
     }
 
-    pub fn sync_system_appearance(cx: &mut impl std::borrow::BorrowMut<App>) {
-        let appearance = std::borrow::BorrowMut::borrow_mut(cx).window_appearance();
+    pub fn apply_component_theme(cx: &mut App) {
+        let app_theme = cx.global::<Theme>();
+        let is_dark = app_theme.mode.is_dark();
+        let text_color = app_theme.text;
+        let blue_color = app_theme.blue;
+        let surface1 = app_theme.surface1;
+
+        let component_mode = if is_dark {
+            gpui_component::theme::ThemeMode::Dark
+        } else {
+            gpui_component::theme::ThemeMode::Light
+        };
+        gpui_component::theme::Theme::change(component_mode, None, cx);
+
+        let theme = gpui_component::theme::Theme::global_mut(cx);
+        theme.foreground = text_color;
+        theme.caret = text_color;
+        theme.accent = surface1;
+        theme.accent_foreground = text_color;
+        theme.link = blue_color;
+        theme.link_hover = blue_color;
+        theme.font_size = px(15.);
+        theme.mono_font_size = px(12.);
+    }
+
+    pub fn sync_system_appearance(cx: &mut App) {
+        let appearance = cx.window_appearance();
         cx.update_global::<Theme, _>(|this, _cx| {
             *this = Self::load_theme(appearance);
         });
-        std::borrow::BorrowMut::borrow_mut(cx).refresh_windows();
+        Self::apply_component_theme(cx);
+        cx.refresh_windows();
     }
 }
