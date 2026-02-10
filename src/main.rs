@@ -16,8 +16,9 @@ use codex::app_server::{AppServer, RequestMethod, ServerNotification};
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, App, Application, Bounds, ClipboardEntry, Context, Entity,
-    ExternalPaths, ImageFormat, KeyBinding, Menu, MenuItem, Render, ScrollHandle, Subscription,
-    Transformation, Window, WindowBounds, WindowOptions, actions, div, img, percentage, px, size,
+    ExternalPaths, ImageFormat, KeyBinding, Menu, MenuItem, PathBuilder, Render, ScrollHandle,
+    Subscription, Transformation, Window, WindowBounds, WindowOptions, actions, canvas, div, img,
+    percentage, point, px, size,
 };
 use gpui_component::Root;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -30,6 +31,7 @@ use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::theme::{Theme as ComponentTheme, hsl};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_component_assets::Assets;
 use serde::{Deserialize, Serialize};
@@ -392,6 +394,39 @@ struct ApprovalOption {
 }
 
 #[derive(Debug, Clone, Default)]
+struct ThreadTokenUsage {
+    total_tokens: u64,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    model_context_window: u64,
+}
+
+impl ThreadTokenUsage {
+    fn used_percent(&self) -> f64 {
+        if self.model_context_window == 0 {
+            return 0.0;
+        }
+        (self.total_tokens as f64 / self.model_context_window as f64 * 100.0).clamp(0.0, 100.0)
+    }
+
+    fn remaining_percent(&self) -> f64 {
+        100.0 - self.used_percent()
+    }
+
+    fn format_tokens(n: u64) -> String {
+        if n >= 1_000_000 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{}k", n / 1_000)
+        } else {
+            format!("{n}")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct RateLimitEntry {
     used_percent: f64,
     window_duration_mins: u64,
@@ -440,7 +475,7 @@ struct AppShell {
     selected_thread_messages: Vec<ThreadMessage>,
     selected_thread_loaded_from_api_id: Option<String>,
     loading_selected_thread: bool,
-    selected_thread_error: Option<String>,
+    selected_thread_error: Option<(String, Entity<TextViewState>)>,
     inflight_threads: HashSet<String>,
     pending_new_thread: bool,
     composing_new_thread_cwd: Option<String>,
@@ -462,6 +497,7 @@ struct AppShell {
     file_picker_selected_ix: usize,
     pending_approvals: Vec<PendingApprovalRequest>,
     approval_selected_ix: usize,
+    thread_token_usage: Option<ThreadTokenUsage>,
     attached_images: Vec<PathBuf>,
     skill_picker_scroll_handle: ScrollHandle,
     file_picker_scroll_handle: ScrollHandle,
@@ -568,6 +604,7 @@ impl AppShell {
             file_picker_selected_ix: 0,
             pending_approvals: Vec::new(),
             approval_selected_ix: 0,
+            thread_token_usage: None,
             attached_images: Vec::new(),
             skill_picker_scroll_handle: ScrollHandle::new(),
             file_picker_scroll_handle: ScrollHandle::new(),
@@ -1515,6 +1552,11 @@ impl AppShell {
         cx.new(|cx| TextViewState::markdown(text, cx))
     }
 
+    fn set_thread_error(&mut self, message: String, cx: &mut Context<Self>) {
+        let view_state = cx.new(|cx| TextViewState::markdown(&message, cx));
+        self.selected_thread_error = Some((message, view_state));
+    }
+
     fn build_thread_message(
         speaker: ThreadSpeaker,
         content: String,
@@ -2253,14 +2295,16 @@ impl AppShell {
                                 Some(selected_thread_id.clone());
                         }
                         Err(error) => {
-                            view.selected_thread_error =
-                                Some(format!("failed to parse thread/resume response: {error}"));
+                            view.set_thread_error(
+                                format!("failed to parse thread/resume response: {error}"),
+                                cx,
+                            );
                             view.selected_thread_loaded_from_api_id =
                                 Some(selected_thread_id.clone());
                         }
                     },
                     Err(error) => {
-                        view.selected_thread_error = Some(format!("thread/resume failed: {error}"));
+                        view.set_thread_error(format!("thread/resume failed: {error}"), cx);
                     }
                 }
 
@@ -2301,6 +2345,7 @@ impl AppShell {
             self.loading_selected_thread = false;
             self.selected_thread_error = None;
             self.streaming_message_ix = None;
+            self.thread_token_usage = None;
             self.ensure_composer_options_for_active_workspace(cx);
             return;
         };
@@ -2310,6 +2355,7 @@ impl AppShell {
         self.selected_thread_loaded_from_api_id = None;
         self.loading_selected_thread = false;
         self.streaming_message_ix = None;
+        self.thread_token_usage = None;
 
         self.selected_thread_messages.clear();
         self.reset_live_tool_message_state();
@@ -2371,7 +2417,7 @@ impl AppShell {
 
     fn submit_selected_approval(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(server) = self._app_server.clone() else {
-            self.selected_thread_error = Some("Not connected to app-server".to_string());
+            self.set_thread_error("Not connected to app-server".to_string(), cx);
             return false;
         };
 
@@ -2398,8 +2444,7 @@ impl AppShell {
                 .await;
             let _ = view.update(cx, |view, cx| {
                 if let Err(error) = result {
-                    view.selected_thread_error =
-                        Some(format!("failed to submit approval: {error}"));
+                    view.set_thread_error(format!("failed to submit approval: {error}"), cx);
                 }
                 cx.notify();
             });
@@ -2771,6 +2816,7 @@ impl AppShell {
         self.selected_thread_loaded_from_api_id = None;
         self.loading_selected_thread = false;
         self.streaming_message_ix = None;
+        self.thread_token_usage = None;
         self.ensure_composer_options_for_cwd(workspace_cwd.clone(), cx);
         cx.notify();
     }
@@ -2823,6 +2869,7 @@ impl AppShell {
         self.pending_new_thread = false;
         self.composing_new_thread_cwd = None;
         self.streaming_message_ix = None;
+        self.thread_token_usage = None;
         self.loading_threads = false;
         self.thread_error = None;
         self.skills_by_cwd.clear();
@@ -2961,6 +3008,41 @@ impl AppShell {
                 .get("secondary")
                 .and_then(Self::parse_rate_limit_entry),
         }
+    }
+
+    fn parse_thread_token_usage(params: &Value) -> Option<ThreadTokenUsage> {
+        let usage = params.get("tokenUsage")?;
+        let total = usage.get("last")?;
+        let context_window = usage
+            .get("modelContextWindow")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if context_window == 0 {
+            return None;
+        }
+        Some(ThreadTokenUsage {
+            total_tokens: total
+                .get("totalTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            input_tokens: total
+                .get("inputTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cached_input_tokens: total
+                .get("cachedInputTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            output_tokens: total
+                .get("outputTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            reasoning_output_tokens: total
+                .get("reasoningOutputTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            model_context_window: context_window,
+        })
     }
 
     fn fetch_rate_limits(&mut self, server: Arc<AppServer>, cx: &mut Context<Self>) {
@@ -3147,10 +3229,10 @@ impl AppShell {
             ) {
                 self.queue_approval_request(notification);
             } else {
-                self.selected_thread_error = Some(format!(
-                    "Unsupported server request: {}",
-                    notification.method
-                ));
+                self.set_thread_error(
+                    format!("Unsupported server request: {}", notification.method),
+                    cx,
+                );
             }
             return;
         }
@@ -3248,6 +3330,22 @@ impl AppShell {
 
                 if applies_to_selected_thread {
                     self.streaming_message_ix = None;
+
+                    if let Some(turn) = notification.params.get("turn")
+                        && let Some(error) = turn.get("error")
+                        && let Some(message) = error.get("message").and_then(Value::as_str)
+                    {
+                        self.set_thread_error(message.to_string(), cx);
+                    }
+                }
+            }
+            "error" => {
+                if applies_to_selected_thread {
+                    if let Some(error) = notification.params.get("error")
+                        && let Some(message) = error.get("message").and_then(Value::as_str)
+                    {
+                        self.set_thread_error(message.to_string(), cx);
+                    }
                 }
             }
             "account/login/completed" => {
@@ -3305,6 +3403,11 @@ impl AppShell {
             "account/rateLimits/updated" => {
                 self.rate_limits = Some(Self::parse_rate_limits(&notification.params));
             }
+            "thread/tokenUsage/updated" => {
+                if applies_to_selected_thread {
+                    self.thread_token_usage = Self::parse_thread_token_usage(&notification.params);
+                }
+            }
             _ => {}
         }
     }
@@ -3345,6 +3448,76 @@ impl AppShell {
             let days = diff / 86400;
             format!("{days}d")
         }
+    }
+
+    fn render_context_ring(
+        diameter: gpui::Pixels,
+        stroke_width: gpui::Pixels,
+        fraction: f32,
+        fill_color: gpui::Hsla,
+        track_color: gpui::Hsla,
+        _label_color: gpui::Hsla,
+    ) -> impl IntoElement {
+        let fraction = fraction.clamp(0.0, 1.0);
+        canvas(
+            move |_, _, _| {},
+            move |bounds, _, window, _| {
+                let center_x = bounds.center().x;
+                let center_y = bounds.center().y;
+                let radius = (diameter - stroke_width) / 2.0;
+
+                let num_segments = 64;
+                let build_arc = |start_frac: f32,
+                                 end_frac: f32|
+                 -> Vec<gpui::Point<gpui::Pixels>> {
+                    let start_angle =
+                        std::f32::consts::FRAC_PI_2 * -1.0 + start_frac * std::f32::consts::TAU;
+                    let end_angle =
+                        std::f32::consts::FRAC_PI_2 * -1.0 + end_frac * std::f32::consts::TAU;
+                    let segments =
+                        ((num_segments as f32 * (end_frac - start_frac)).ceil() as usize).max(2);
+                    (0..=segments)
+                        .map(|i| {
+                            let t = i as f32 / segments as f32;
+                            let angle = start_angle + t * (end_angle - start_angle);
+                            point(
+                                center_x + radius * angle.cos(),
+                                center_y + radius * angle.sin(),
+                            )
+                        })
+                        .collect()
+                };
+
+                if fraction < 1.0 {
+                    let track_points = build_arc(fraction, 1.0);
+                    if track_points.len() >= 2 {
+                        let mut builder = PathBuilder::stroke(stroke_width);
+                        builder.move_to(track_points[0]);
+                        for p in &track_points[1..] {
+                            builder.line_to(*p);
+                        }
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, track_color);
+                        }
+                    }
+                }
+
+                if fraction > 0.0 {
+                    let fill_points = build_arc(0.0, fraction);
+                    if fill_points.len() >= 2 {
+                        let mut builder = PathBuilder::stroke(stroke_width);
+                        builder.move_to(fill_points[0]);
+                        for p in &fill_points[1..] {
+                            builder.line_to(*p);
+                        }
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, fill_color);
+                        }
+                    }
+                }
+            },
+        )
+        .size(diameter)
     }
 
     fn render_rate_limit_bar(
@@ -3568,7 +3741,7 @@ impl AppShell {
         }
 
         let Some(server) = self._app_server.clone() else {
-            self.selected_thread_error = Some("Not connected to app-server".to_string());
+            self.set_thread_error("Not connected to app-server".to_string(), cx);
             cx.notify();
             return;
         };
@@ -3644,8 +3817,10 @@ impl AppShell {
                             let _ = view.update(cx, |view, cx| {
                                 view.pending_new_thread = false;
                                 if view.selected_thread_id.is_none() {
-                                    view.selected_thread_error =
-                                        Some("thread/start returned no thread id".to_string());
+                                    view.set_thread_error(
+                                        "thread/start returned no thread id".to_string(),
+                                        cx,
+                                    );
                                 }
                                 cx.notify();
                             });
@@ -3668,8 +3843,7 @@ impl AppShell {
                         let _ = view.update(cx, |view, cx| {
                             view.pending_new_thread = false;
                             if view.selected_thread_id.is_none() {
-                                view.selected_thread_error =
-                                    Some(format!("thread/start failed: {error}"));
+                                view.set_thread_error(format!("thread/start failed: {error}"), cx);
                             }
                             cx.notify();
                         });
@@ -3705,8 +3879,7 @@ impl AppShell {
                     Err(error) => {
                         view.inflight_threads.remove(thread_id.as_str());
                         if view.selected_thread_id.as_deref() == Some(thread_id.as_str()) {
-                            view.selected_thread_error =
-                                Some(format!("turn/start failed: {error}"));
+                            view.set_thread_error(format!("turn/start failed: {error}"), cx);
                         }
                     }
                 }
@@ -4205,7 +4378,8 @@ impl Render for AppShell {
                 Sidebar::<AnySidebarItem>::new("sidebar")
                     .w(px(300.))
                     .collapsed(self.sidebar_collapsed)
-                    .header(SidebarHeader::new())
+                    // .header(SidebarHeader::new())
+                    .header(div().h_4())
                     .child(
                         SidebarMenu::new()
                             .child(
@@ -4333,21 +4507,36 @@ impl Render for AppShell {
                                     .dropdown_menu_with_anchor(gpui::Corner::TopLeft, {
                                         let this = this.clone();
                                         let logout_in_progress = self.logout_in_progress;
+                                        let account_email = self.account_email.clone();
                                         move |menu: PopupMenu,
                                               _window: &mut Window,
                                               _cx: &mut gpui::Context<PopupMenu>| {
+                                            let menu = if let Some(ref email) = account_email {
+                                                menu.item(
+                                                    PopupMenuItem::new(email.clone())
+                                                        .icon(IconName::CircleUser),
+                                                )
+                                                .separator()
+                                            } else {
+                                                menu
+                                            };
+
                                             if logout_in_progress {
-                                                return menu.label("Logging out...");
+                                                return menu.separator().label("Logging out...");
                                             }
 
-                                            menu.item(PopupMenuItem::new("Logout").on_click({
-                                                let this = this.clone();
-                                                move |_, _, cx| {
-                                                    let _ = this.update(cx, |view, cx| {
-                                                        view.start_logout(cx);
-                                                    });
-                                                }
-                                            }))
+                                            menu.item(
+                                                PopupMenuItem::new("Log out")
+                                                    .icon(IconName::ArrowRight)
+                                                    .on_click({
+                                                        let this = this.clone();
+                                                        move |_, _, cx| {
+                                                            let _ = this.update(cx, |view, cx| {
+                                                                view.start_logout(cx);
+                                                            });
+                                                        }
+                                                    }),
+                                            )
                                         }
                                     }),
                             )
@@ -4875,12 +5064,32 @@ impl Render for AppShell {
                                                 }
                                                 })
                                                     .collect::<Vec<_>>();
-                                                    div().w_full().children(chat_rows).into_any_element()
-                                                } else if let Some(error) = &self.selected_thread_error {
+                                                    let mut container = div().w_full().children(chat_rows);
+                                                    if let Some((_msg, view_state)) = &self.selected_thread_error {
+                                                        container = container.child(
+                                                            div()
+                                                                .mt(px(8.))
+                                                                .px(px(16.))
+                                                                .py(px(8.))
+                                                                .rounded(px(6.))
+                                                                .bg(red_color.opacity(0.1))
+                                                                .text_sm()
+                                                                .text_color(red_color)
+                                                                .child(
+                                                                    TextView::new(view_state)
+                                                                        .text_color(red_color),
+                                                                ),
+                                                        );
+                                                    }
+                                                    container.into_any_element()
+                                                } else if let Some((_msg, view_state)) = &self.selected_thread_error {
                                                     div()
                                                         .text_sm()
                                                         .text_color(red_color)
-                                                        .child(format!("Unable to render thread: {error}"))
+                                                        .child(
+                                                            TextView::new(view_state)
+                                                                .text_color(red_color),
+                                                        )
                                                         .into_any_element()
                                                 } else if self.loading_threads
                                                     || self.loading_selected_thread
@@ -5713,6 +5922,69 @@ impl Render for AppShell {
                                                     .flex()
                                                     .items_center()
                                                     .gap(px(12.))
+                                                    .when_some(
+                                                        self.thread_token_usage.clone(),
+                                                        {
+                                                            let overlay_color = overlay_color;
+                                                            let surface0 = surface0;
+                                                            let blue_color = blue_color;
+                                                            move |el, usage: ThreadTokenUsage| {
+                                                                let used = usage.used_percent();
+                                                                let ring_color = if used > 90.0 {
+                                                                    gpui::Hsla {
+                                                                        h: 0.0,
+                                                                        s: 0.7,
+                                                                        l: 0.55,
+                                                                        a: 1.0,
+                                                                    }
+                                                                } else if used > 70.0 {
+                                                                    gpui::Hsla {
+                                                                        h: 40.0 / 360.0,
+                                                                        s: 0.8,
+                                                                        l: 0.55,
+                                                                        a: 1.0,
+                                                                    }
+                                                                } else {
+                                                                    blue_color
+                                                                };
+                                                                let used_label =
+                                                                    ThreadTokenUsage::format_tokens(
+                                                                        usage.total_tokens,
+                                                                    );
+                                                                let total_label =
+                                                                    ThreadTokenUsage::format_tokens(
+                                                                        usage.model_context_window,
+                                                                    );
+                                                                let remaining =
+                                                                    usage.remaining_percent();
+                                                                el.child(
+                                                                    div()
+                                                                        .id(
+                                                                            "context-window-ring",
+                                                                        )
+                                                                        .cursor_pointer()
+                                                                        .tooltip(move |window, cx| {
+                                                                            Tooltip::new(format!(
+                                                                                "Context: {used:.0}% used ({remaining:.0}% left) · {used_label} / {total_label}"
+                                                                            ))
+                                                                            .build(window, cx)
+                                                                        })
+                                                                        .size(px(24.))
+                                                                        .child(
+                                                                            Self::render_context_ring(
+                                                                                px(20.),
+                                                                                px(2.5),
+                                                                                used as f32
+                                                                                    / 100.0,
+                                                                                ring_color,
+                                                                                surface0,
+                                                                                overlay_color,
+                                                                            ),
+                                                                        ),
+                                                                )
+                                                            }
+                                                        },
+                                                    )
                                                     .child(
                                                         div()
                                                             .size(px(34.))
