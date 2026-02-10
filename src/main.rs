@@ -63,6 +63,7 @@ fn app_menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("About Agent Hub", About),
                 MenuItem::separator(),
+                MenuItem::separator(),
                 MenuItem::action("Settings...", Settings),
                 MenuItem::separator(),
                 MenuItem::action("Hide Agent Hub", Hide),
@@ -4065,13 +4066,14 @@ impl AppShell {
                                 div()
                                     .flex()
                                     .flex_col()
+                                    .items_start()
                                     .min_w_full()
                                     .font_family(font_mono.clone())
                                     .text_sm()
                                     .children(file_diff.rows.iter().map(|row| {
                                         match row {
                                             diff_view::DiffRow::HunkHeader(h) => div()
-                                                .w_full()
+                                                .min_w_full()
                                                 .px(px(12.))
                                                 .py(px(4.))
                                                 .bg(surface0)
@@ -4112,7 +4114,8 @@ impl AppShell {
                                                     .flex()
                                                     .flex_row()
                                                     .bg(row_bg)
-                                                    .child(div().w(px(3.)).h_full().bg(bar_color))
+                                                    .border_l_3()
+                                                    .border_color(bar_color)
                                                     .child(
                                                         div()
                                                             .w(px(line_number_column_width))
@@ -4137,7 +4140,7 @@ impl AppShell {
                                                     )
                                                     .child(
                                                         div()
-                                                            .flex_1()
+                                                            .flex_shrink_0()
                                                             .px(px(8.))
                                                             .py(px(1.))
                                                             .text_color(text_color)
@@ -4390,15 +4393,37 @@ impl AppShell {
                                     .bg(surface0)
                                     .px(px(10.))
                                     .py(px(8.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
                                     .text_sm()
                                     .text_color(subtext_color)
-                                    .child(format!(
-                                        "{} · +{} -{}",
-                                        file_label,
-                                        snapshot.total_additions,
-                                        snapshot.total_deletions
-                                    ))
-                                    .child(div().mt(px(4.)).text_xs().child(snapshot.cwd.clone())),
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_xs()
+                                            .child(snapshot.cwd.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .child(file_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .child(format!(
+                                                "+{} -{}",
+                                                snapshot.total_additions,
+                                                snapshot.total_deletions
+                                            )),
+                                    ),
                             )
                             .child(
                                 div()
@@ -4413,63 +4438,69 @@ impl AppShell {
                                     .flex()
                                     .child(
                                         div()
-                                            .id("branch-diff-file-list-scroll")
+                                            .relative()
                                             .w(px(180.))
                                             .min_w(px(140.))
                                             .max_w(px(220.))
                                             .h_full()
                                             .min_h_0()
-                                            .overflow_y_scroll()
-                                            .track_scroll(&self.branch_diff_file_list_scroll_handle)
-                                            .py(px(6.))
-                                            .children(snapshot.file_diffs.iter().map(|file_diff| {
-                                                let path = file_diff.path.clone();
-                                                let select_path = path.clone();
-                                                let additions = file_diff.additions;
-                                                let deletions = file_diff.deletions;
-                                                let is_selected = selected_path
-                                                    .as_ref()
-                                                    .is_some_and(|selected| selected == &path);
+                                            .child(
                                                 div()
-                                                    .w_full()
-                                                    .min_w_0()
-                                                    .px(px(10.))
+                                                    .id("branch-diff-file-list-scroll")
+                                                    .size_full()
+                                                    .overflow_y_scroll()
+                                                    .track_scroll(&self.branch_diff_file_list_scroll_handle)
                                                     .py(px(6.))
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(8.))
-                                                    .when(is_selected, |this| this.bg(mantle))
-                                                    .hover(|this| this.bg(mantle))
-                                                    .cursor_pointer()
-                                                    .on_mouse_down(
-                                                        gpui::MouseButton::Left,
-                                                        cx.listener(move |view, _, _, cx| {
-                                                            view.branch_diff_selected_path =
-                                                                Some(select_path.clone());
-                                                            cx.notify();
-                                                        }),
-                                                    )
-                                                    .child(
+                                                    .children(snapshot.file_diffs.iter().enumerate().map(|(ix, file_diff)| {
+                                                        let path = file_diff.path.clone();
+                                                        let select_path = path.clone();
+                                                        let additions = file_diff.additions;
+                                                        let deletions = file_diff.deletions;
+                                                        let is_selected = selected_path
+                                                            .as_ref()
+                                                            .is_some_and(|selected| selected == &path);
                                                         div()
-                                                            .flex_1()
+                                                            .id(("branch-diff-file", ix))
+                                                            .w_full()
                                                             .min_w_0()
-                                                            .overflow_hidden()
-                                                            .text_ellipsis()
-                                                            .whitespace_nowrap()
-                                                            .text_xs()
-                                                            .text_color(text_color)
-                                                            .child(path),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(subtext_color)
-                                                            .child(format!(
-                                                                "+{} -{}",
-                                                                additions, deletions
-                                                            )),
-                                                    )
-                                            }))
+                                                            .px(px(10.))
+                                                            .py(px(6.))
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap(px(8.))
+                                                            .when(is_selected, |this| this.bg(mantle))
+                                                            .hover(|this| this.bg(mantle))
+                                                            .cursor_pointer()
+                                                            .on_mouse_down(
+                                                                gpui::MouseButton::Left,
+                                                                cx.listener(move |view, _, _, cx| {
+                                                                    view.branch_diff_selected_path =
+                                                                        Some(select_path.clone());
+                                                                    cx.notify();
+                                                                }),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .min_w_0()
+                                                                    .overflow_hidden()
+                                                                    .text_ellipsis()
+                                                                    .whitespace_nowrap()
+                                                                    .text_xs()
+                                                                    .text_color(text_color)
+                                                                    .child(path),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(subtext_color)
+                                                                    .child(format!(
+                                                                        "+{} -{}",
+                                                                        additions, deletions
+                                                                    )),
+                                                            )
+                                                    })),
+                                            )
                                             .vertical_scrollbar(
                                                 &self.branch_diff_file_list_scroll_handle,
                                             ),
@@ -4477,60 +4508,14 @@ impl AppShell {
                                     .child(div().w(px(1.)).h_full().bg(surface1))
                                     .child(
                                         div()
+                                            .relative()
                                             .flex_1()
                                             .min_w_0()
                                             .min_h_0()
-                                            .flex()
-                                            .flex_col()
-                                            .child(
-                                                div()
-                                                    .w_full()
-                                                    .h(px(36.))
-                                                    .px(px(10.))
-                                                    .border_b_1()
-                                                    .border_color(surface1)
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .overflow_hidden()
-                                                            .text_ellipsis()
-                                                            .whitespace_nowrap()
-                                                            .text_sm()
-                                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                                            .text_color(text_color)
-                                                            .child(
-                                                                selected_path
-                                                                    .clone()
-                                                                    .unwrap_or_else(|| {
-                                                                        "Select a file".to_string()
-                                                                    }),
-                                                            ),
-                                                    )
-                                                    .when_some(
-                                                        selected_file.clone(),
-                                                        |this, file_diff| {
-                                                            this.child(
-                                                                div()
-                                                                    .text_xs()
-                                                                    .text_color(subtext_color)
-                                                                    .child(format!(
-                                                                        "+{} -{}",
-                                                                        file_diff.additions,
-                                                                        file_diff.deletions
-                                                                    )),
-                                                            )
-                                                        },
-                                                    ),
-                                            )
                                             .child(
                                                 div()
                                                     .id("branch-diff-scroll")
-                                                    .flex_1()
-                                                    .min_h_0()
+                                                    .size_full()
                                                     .overflow_y_scroll()
                                                     .track_scroll(&self.branch_diff_scroll_handle)
                                                     .px(px(10.))
@@ -4562,10 +4547,10 @@ impl AppShell {
                                                                 "Select a file to view its diff.",
                                                             )
                                                             .into_any_element()
-                                                    })
-                                                    .vertical_scrollbar(
-                                                        &self.branch_diff_scroll_handle,
-                                                    ),
+                                                    }),
+                                            )
+                                            .vertical_scrollbar(
+                                                &self.branch_diff_scroll_handle,
                                             ),
                                     ),
                             )
