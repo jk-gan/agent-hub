@@ -13,18 +13,8 @@ env:
 
 jobs:
   build-macos:
-    name: Build macOS (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            runner: macos-latest        # Apple Silicon (M-series)
-            arch: arm64
-          - target: x86_64-apple-darwin
-            runner: macos-13            # Intel
-            arch: x86_64
+    name: Build macOS (Apple Silicon)
+    runs-on: macos-latest
 
     steps:
       - name: Checkout repository
@@ -33,40 +23,45 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
 
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target aarch64-apple-darwin
 
       - name: Package application
+        run: cargo packager --release --target aarch64-apple-darwin --verbose
+
+      - name: Ad-hoc sign the app bundle
         run: |
-          cargo packager --release --target ${{ matrix.target }} --verbose
-        env:
-          # Skip code signing for now (unsigned builds)
-          # Users will need to right-click → Open on first launch
-          APPLE_SIGNING_IDENTITY: "-"
+          # Find the .app bundle
+          APP_BUNDLE=$(find target -name "*.app" -type d | head -1)
+          if [ -n "$APP_BUNDLE" ]; then
+            echo "Ad-hoc signing: $APP_BUNDLE"
+            codesign --remove-signature "$APP_BUNDLE" || true
+            codesign --force --deep --sign - "$APP_BUNDLE"
+            echo "Ad-hoc signing complete"
+          else
+            echo "Warning: No .app bundle found to sign"
+          fi
 
       - name: Prepare artifacts
         run: |
           mkdir -p dist
           # Find and copy .app bundle (compress to zip for upload)
-          if [ -d "target/${{ matrix.target }}/release/bundle/macos" ]; then
-            APP_DIR="target/${{ matrix.target }}/release/bundle/macos"
+          if [ -d "target/aarch64-apple-darwin/release/bundle/macos" ]; then
+            APP_DIR="target/aarch64-apple-darwin/release/bundle/macos"
           elif [ -d "target/release/bundle/macos" ]; then
             APP_DIR="target/release/bundle/macos"
           else
             echo "Looking for .app in common locations..."
             find target -name "*.app" -type d 2>/dev/null || true
             find target -name "*.dmg" -type f 2>/dev/null || true
-            # Try the packager output directory
             APP_DIR=$(find target -path "*/bundle/macos" -type d 2>/dev/null | head -1)
           fi
 
@@ -76,7 +71,7 @@ jobs:
           if ls "$APP_DIR"/*.app 1>/dev/null 2>&1; then
             cd "$APP_DIR"
             for app in *.app; do
-              zip -r -y "$GITHUB_WORKSPACE/dist/Agent-Hub-${{ matrix.arch }}.app.zip" "$app"
+              zip -r -y "$GITHUB_WORKSPACE/dist/Agent-Hub-arm64.app.zip" "$app"
             done
             cd "$GITHUB_WORKSPACE"
           fi
@@ -88,7 +83,7 @@ jobs:
           for dmg in dist/*.dmg; do
             [ -f "$dmg" ] || continue
             base=$(basename "$dmg" .dmg)
-            mv "$dmg" "dist/${base}-${{ matrix.arch }}.dmg"
+            mv "$dmg" "dist/${base}-arm64.dmg"
           done
 
           echo "=== Artifacts ==="
@@ -97,7 +92,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: agent-hub-macos-${{ matrix.arch }}
+          name: agent-hub-macos-arm64
           path: dist/*
           if-no-files-found: error
 
@@ -126,5 +121,18 @@ jobs:
           draft: true
           generate_release_notes: true
           files: artifacts/*
+          body: |
+            ## Installation
+
+            ### macOS (Apple Silicon)
+
+            1. Download `Agent-Hub-arm64.dmg` or `Agent-Hub-arm64.app.zip`.
+            2. If using `.dmg`: Open the disk image and drag **Agent Hub** to your Applications folder.
+               If using `.app.zip`: Unzip and move **Agent Hub.app** to your Applications folder.
+            3. **Important**: Since this app is not yet code-signed, macOS may show an error saying the app "is damaged". To fix this, open Terminal and run:
+               ```
+               xattr -cr "/Applications/Agent Hub.app"
+               ```
+            4. Now you can open Agent Hub normally from your Applications folder.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
