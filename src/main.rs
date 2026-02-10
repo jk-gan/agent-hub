@@ -37,8 +37,8 @@ use gpui_component_assets::Assets;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sidebar::{
-    AnySidebarItem, Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu,
-    SidebarMenuItem, SidebarToggleButton,
+    AnySidebarItem, Sidebar, SidebarFooter, SidebarGroup, SidebarMenu, SidebarMenuItem,
+    SidebarToggleButton,
 };
 use theme::Theme as AppTheme;
 
@@ -465,7 +465,6 @@ struct AppShell {
     loading_threads: bool,
     sidebar_collapsed: bool,
     thread_error: Option<String>,
-    cwd: String,
     threads: Vec<ThreadRow>,
     known_workspace_cwds: HashSet<String>,
     expanded_workspace_groups: HashSet<String>,
@@ -527,7 +526,6 @@ impl AppShell {
     ];
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let cwd = Self::current_cwd();
         let expanded_workspace_groups = HashSet::new();
         let threads = Vec::new();
         let thread_error = None;
@@ -572,7 +570,6 @@ impl AppShell {
             loading_threads: false,
             sidebar_collapsed: false,
             thread_error,
-            cwd: cwd.clone(),
             threads,
             known_workspace_cwds,
             expanded_workspace_groups,
@@ -590,11 +587,11 @@ impl AppShell {
             live_tool_message_ix_by_item_id: HashMap::new(),
             skills_by_cwd: HashMap::new(),
             loading_skills_cwds: HashSet::new(),
-            active_skills_cwd: cwd.clone(),
+            active_skills_cwd: String::new(),
             active_skills: Vec::new(),
             files_by_cwd: HashMap::new(),
             loading_files_cwds: HashSet::new(),
-            active_files_cwd: cwd.clone(),
+            active_files_cwd: String::new(),
             active_files: Vec::new(),
             available_models: Vec::new(),
             loading_model_options: false,
@@ -615,13 +612,6 @@ impl AppShell {
         };
         shell.refresh_selected_thread(cx);
         shell
-    }
-
-    fn current_cwd() -> String {
-        std::env::current_dir()
-            .ok()
-            .and_then(|path| path.to_str().map(str::to_owned))
-            .unwrap_or_else(|| ".".to_string())
     }
 
     fn make_title(preview: Option<&str>, id: &str) -> String {
@@ -684,7 +674,7 @@ impl AppShell {
             .and_then(|thread_id| self.threads.iter().find(|thread| thread.id == thread_id))
             .map(|thread| thread.cwd.clone())
             .filter(|cwd| !cwd.is_empty())
-            .unwrap_or_else(|| self.cwd.clone())
+            .unwrap_or_default()
     }
 
     fn parse_model_options(payload: Value) -> Result<Vec<ModelOption>, String> {
@@ -901,6 +891,12 @@ impl AppShell {
 
     fn collect_workspace_files(cwd: &str, max_files: usize) -> Vec<String> {
         let root = PathBuf::from(cwd);
+
+        // Avoid broad filesystem scans like "/" or "/Users".
+        if root.components().count() <= 2 {
+            return Vec::new();
+        }
+
         let Ok(metadata) = fs::metadata(&root) else {
             return Vec::new();
         };
@@ -1038,6 +1034,10 @@ impl AppShell {
     }
 
     fn ensure_skills_for_cwd(&mut self, cwd: String, cx: &mut Context<Self>) {
+        if cwd.is_empty() {
+            return;
+        }
+
         if self.active_skills_cwd != cwd {
             self.set_active_skills_for_cwd(&cwd);
         }
@@ -1082,6 +1082,10 @@ impl AppShell {
     }
 
     fn ensure_files_for_cwd(&mut self, cwd: String, cx: &mut Context<Self>) {
+        if cwd.is_empty() {
+            return;
+        }
+
         if self.active_files_cwd != cwd {
             self.set_active_files_for_cwd(&cwd);
         }
@@ -1505,7 +1509,7 @@ impl AppShell {
         groups
     }
 
-    fn parse_thread_rows(value: Value, cwd: &str) -> Result<Vec<ThreadRow>, String> {
+    fn parse_thread_rows(value: Value) -> Result<Vec<ThreadRow>, String> {
         let response: ThreadListResponse =
             serde_json::from_value(value).map_err(|error| format!("invalid response: {error}"))?;
 
@@ -1519,7 +1523,7 @@ impl AppShell {
                     title: Self::make_title(entry.preview.as_deref(), &id),
                     id,
                     updated_at: timestamp,
-                    cwd: entry.cwd.unwrap_or_else(|| cwd.to_string()),
+                    cwd: entry.cwd.unwrap_or_default(),
                 }
             })
             .collect::<Vec<_>>();
@@ -1530,22 +1534,14 @@ impl AppShell {
         Ok(rows)
     }
 
-    fn preferred_thread(
-        threads: &[ThreadRow],
-        cwd: &str,
-        selected_id: Option<&str>,
-    ) -> Option<ThreadRow> {
+    fn preferred_thread(threads: &[ThreadRow], selected_id: Option<&str>) -> Option<ThreadRow> {
         if let Some(selected_id) = selected_id
             && let Some(row) = threads.iter().find(|row| row.id == selected_id)
         {
             return Some(row.clone());
         }
 
-        threads
-            .iter()
-            .find(|row| row.cwd == cwd)
-            .or_else(|| threads.first())
-            .cloned()
+        threads.first().cloned()
     }
 
     fn new_message_state(text: &str, cx: &mut Context<Self>) -> Entity<TextViewState> {
@@ -2333,8 +2329,7 @@ impl AppShell {
             return;
         }
 
-        let selected =
-            Self::preferred_thread(&self.threads, &self.cwd, self.selected_thread_id.as_deref());
+        let selected = Self::preferred_thread(&self.threads, self.selected_thread_id.as_deref());
 
         let Some(row) = selected else {
             self.selected_thread_id = None;
@@ -2432,16 +2427,12 @@ impl AppShell {
         let selected_ix = self.approval_selected_ix.min(approval.options.len() - 1);
         let response_payload = approval.options[selected_ix].response_payload.clone();
         let request_id = approval.request_id.clone();
-        let method = approval.method.clone();
-        let thread_id = approval.thread_id.clone();
 
         self.pending_approvals.remove(0);
         self.approval_selected_ix = 0;
 
         cx.spawn(async move |view, cx| {
-            let result = server
-                .respond(request_id, &method, thread_id.as_deref(), response_payload)
-                .await;
+            let result = server.respond(request_id, response_payload).await;
             let _ = view.update(cx, |view, cx| {
                 if let Err(error) = result {
                     view.set_thread_error(format!("failed to submit approval: {error}"), cx);
@@ -2874,11 +2865,11 @@ impl AppShell {
         self.thread_error = None;
         self.skills_by_cwd.clear();
         self.loading_skills_cwds.clear();
-        self.active_skills_cwd = self.cwd.clone();
+        self.active_skills_cwd = String::new();
         self.active_skills.clear();
         self.files_by_cwd.clear();
         self.loading_files_cwds.clear();
-        self.active_files_cwd = self.cwd.clone();
+        self.active_files_cwd = String::new();
         self.active_files.clear();
         self.available_models.clear();
         self.loading_model_options = false;
@@ -2918,7 +2909,6 @@ impl AppShell {
         }
 
         self.loading_threads = true;
-        let cwd = self.cwd.clone();
         cx.notify();
 
         cx.spawn(async move |view, cx| {
@@ -2928,11 +2918,10 @@ impl AppShell {
             let _ = view.update(cx, |view, cx| {
                 view.loading_threads = false;
                 match response {
-                    Ok(payload) => match Self::parse_thread_rows(payload.clone(), &cwd) {
+                    Ok(payload) => match Self::parse_thread_rows(payload.clone()) {
                         Ok(rows) => {
                             view.thread_error = None;
                             view.threads = rows;
-                            view.known_workspace_cwds.insert(cwd.clone());
                             for thread in &view.threads {
                                 if !thread.cwd.trim().is_empty() {
                                     view.known_workspace_cwds.insert(thread.cwd.clone());
@@ -4174,8 +4163,6 @@ impl Render for AppShell {
             let hero_subtext = hsl(220., 8., 50.);
             let primary_bg = hsl(220., 10., 5.);
             let disabled_bg = hsl(220., 12., 84.);
-            let secondary_border = hsl(220., 10., 84.);
-            let secondary_text = hsl(220., 10., 20.);
             let icon_border = hsl(220., 12., 78.);
 
             return div()
@@ -4270,36 +4257,6 @@ impl Render for AppShell {
                                 )
                                 .child(
                                     div()
-                                        .w_full()
-                                        .max_w(px(380.))
-                                        .h(px(56.))
-                                        .rounded(px(999.))
-                                        .border_1()
-                                        .border_color(secondary_border)
-                                        .bg(hero_bg)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .on_mouse_down(
-                                            gpui::MouseButton::Left,
-                                            cx.listener(|view, _, _, cx| {
-                                                view.auth_error = Some(
-                                                    "API key login is not implemented yet."
-                                                        .to_string(),
-                                                );
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(secondary_text)
-                                                .child("Enter API key"),
-                                        ),
-                                )
-                                .child(
-                                    div()
                                         .mt(px(6.))
                                         .text_sm()
                                         .text_color(hero_subtext)
@@ -4378,7 +4335,6 @@ impl Render for AppShell {
                 Sidebar::<AnySidebarItem>::new("sidebar")
                     .w(px(300.))
                     .collapsed(self.sidebar_collapsed)
-                    // .header(SidebarHeader::new())
                     .header(div().h_4())
                     .child(
                         SidebarMenu::new()

@@ -18,7 +18,6 @@ mod header;
 mod menu;
 pub use footer::*;
 pub use group::*;
-pub use header::*;
 pub use menu::*;
 
 const DEFAULT_WIDTH: Pixels = px(255.);
