@@ -3777,18 +3777,8 @@ impl AppShell {
         Self::fit_size_to_bounds(width, height, max_width, max_height)
     }
 
-    fn composer_attachment_preview_size(image_ref: &str, attachment_count: usize) -> (f32, f32) {
-        let (default_width, default_height, max_width, max_height) = if attachment_count <= 1 {
-            (150., 96., 220., 140.)
-        } else {
-            (110., 72., 150., 96.)
-        };
-
-        let Some((width, height)) = Self::local_image_dimensions(image_ref) else {
-            return (default_width, default_height);
-        };
-
-        Self::fit_size_to_bounds(width, height, max_width, max_height)
+    fn composer_attachment_preview_size(_image_ref: &str, _attachment_count: usize) -> (f32, f32) {
+        (40., 40.)
     }
 
     fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5322,7 +5312,7 @@ impl Render for AppShell {
                                                                                 img(path_clone)
                                                                                     .size_full()
                                                                                     .object_fit(
-                                                                                        gpui::ObjectFit::ScaleDown,
+                                                                                        gpui::ObjectFit::Cover,
                                                                                     ),
                                                                             ),
                                                                     )
