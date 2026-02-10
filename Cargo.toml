@@ -2,6 +2,7 @@
 name = "agent-hub"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/jk-gan/agent-hub"
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed" }
@@ -16,8 +17,18 @@ anyhow = "1.0.101"
 rust-embed = "8.11.0"
 imagesize = "0.13.0"
 
-[package.metadata.bundle]
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[package.metadata.packager]
+before-packaging-command = "cargo build --release"
 name = "Agent Hub"
+product-name = "Agent Hub"
 identifier = "com.jk-gan.agent-hub"
-icon = ["assets/app-icon.icns"]
-osx_minimum_system_version = "11.0"
+authors = ["Jun Kai Gan"]
+description = "Agent Hub - An AI coding assistant platform"
+resources = ["Cargo.toml", "src", "assets"]
+icons = ["assets/app-icon.icns"]
+formats = ["app", "dmg"]
