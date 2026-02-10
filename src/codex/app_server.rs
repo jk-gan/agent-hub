@@ -35,6 +35,10 @@ pub enum RequestMethod {
     SkillsList,
     #[serde(rename = "turn/start")]
     TurnStart,
+    #[serde(rename = "turn/interrupt")]
+    TurnInterrupt,
+    #[serde(rename = "turn/steer")]
+    TurnSteer,
     #[serde(rename = "account/rateLimits/read")]
     AccountRateLimitsRead,
 }

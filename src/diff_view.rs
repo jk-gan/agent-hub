@@ -150,6 +150,112 @@ pub fn parse_unified_diff(path: String, diff: &str) -> ParsedFileDiff {
     }
 }
 
+fn split_diff_header_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if in_quotes {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_quotes = false,
+                _ => current.push(ch),
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_quotes = true,
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn normalize_diff_path(raw: &str) -> String {
+    let path = raw.trim();
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn parse_path_from_diff_header(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("diff --git ")?;
+    let tokens = split_diff_header_tokens(rest);
+    let raw_path = tokens.get(1).or_else(|| tokens.first())?;
+    let path = normalize_diff_path(raw_path);
+    if path.trim().is_empty() {
+        return None;
+    }
+    Some(path)
+}
+
+fn parse_path_from_plus_plus_plus(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("+++ ")?;
+    if rest.trim() == "/dev/null" {
+        return None;
+    }
+
+    let trimmed = rest.trim();
+    let raw = if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    let path = normalize_diff_path(raw);
+    if path.trim().is_empty() {
+        return None;
+    }
+    Some(path)
+}
+
+pub fn parse_multi_file_unified_diff(diff: &str) -> Vec<ParsedFileDiff> {
+    let mut chunks: Vec<(Option<String>, Vec<String>)> = Vec::new();
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            chunks.push((parse_path_from_diff_header(line), vec![line.to_string()]));
+            continue;
+        }
+
+        if let Some((_path, lines)) = chunks.last_mut() {
+            lines.push(line.to_string());
+        }
+    }
+
+    chunks
+        .into_iter()
+        .filter_map(|(path, lines)| {
+            let path = path.or_else(|| {
+                lines
+                    .iter()
+                    .find_map(|line| parse_path_from_plus_plus_plus(line))
+            })?;
+            let chunk_text = lines.join("\n");
+            Some(parse_unified_diff(path, &chunk_text))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +294,53 @@ mod tests {
         } else {
             panic!("expected line row");
         }
+    }
+
+    #[test]
+    fn parse_multi_file_unified_diff_parses_each_file() {
+        let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 1111111..2222222 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-fn old() {}
++fn new() {}
+diff --git a/README.md b/README.md
+index 3333333..4444444 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,2 @@
+ # Title
++More
+";
+
+        let parsed = parse_multi_file_unified_diff(diff);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].path, "src/lib.rs");
+        assert_eq!(parsed[0].additions, 1);
+        assert_eq!(parsed[0].deletions, 1);
+        assert_eq!(parsed[1].path, "README.md");
+        assert_eq!(parsed[1].additions, 1);
+        assert_eq!(parsed[1].deletions, 0);
+    }
+
+    #[test]
+    fn parse_multi_file_unified_diff_handles_quoted_paths() {
+        let diff = "\
+diff --git \"a/docs/with space.md\" \"b/docs/with space.md\"
+index 3333333..4444444 100644
+--- \"a/docs/with space.md\"
++++ \"b/docs/with space.md\"
+@@ -1 +1 @@
+-old
++new
+";
+
+        let parsed = parse_multi_file_unified_diff(diff);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "docs/with space.md");
+        assert_eq!(parsed[0].additions, 1);
+        assert_eq!(parsed[0].deletions, 1);
     }
 }

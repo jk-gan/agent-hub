@@ -4,7 +4,7 @@ mod diff_view;
 mod sidebar;
 mod theme;
 
-use std::cmp::Reverse;
+use std::cmp::{Reverse, max, min};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
@@ -17,9 +17,9 @@ use codex::app_server::{AppServer, RequestMethod, ServerNotification};
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, App, Application, Bounds, ClipboardEntry, Context, Entity,
-    ExternalPaths, ImageFormat, KeyBinding, Menu, MenuItem, PathBuilder, Render, ScrollHandle,
-    Subscription, Transformation, Window, WindowBounds, WindowOptions, actions, canvas, div, img,
-    percentage, point, px, size,
+    ExternalPaths, FocusHandle, ImageFormat, KeyBinding, Menu, MenuItem, PathBuilder, Pixels,
+    Render, ScrollHandle, Subscription, Transformation, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, img, percentage, point, px, size,
 };
 use gpui_component::Root;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -440,6 +440,19 @@ struct RateLimits {
     secondary: Option<RateLimitEntry>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct BranchDiffSnapshot {
+    cwd: String,
+    branch_name: String,
+    base_ref: String,
+    file_diffs: Vec<diff_view::ParsedFileDiff>,
+    total_additions: usize,
+    total_deletions: usize,
+}
+
+#[derive(Debug, Clone, Render)]
+struct DraggedBranchDiffSidebarResize;
+
 #[derive(Debug, Clone, PartialEq)]
 struct PendingApprovalRequest {
     request_id: Value,
@@ -465,6 +478,13 @@ struct AppShell {
     login_url: Option<String>,
     loading_threads: bool,
     sidebar_collapsed: bool,
+    branch_diff_sidebar_open: bool,
+    branch_diff_loading: bool,
+    branch_diff_needs_refresh: bool,
+    branch_diff_snapshot: Option<BranchDiffSnapshot>,
+    branch_diff_error: Option<String>,
+    branch_diff_selected_path: Option<String>,
+    branch_diff_panel_width: Pixels,
     thread_error: Option<String>,
     threads: Vec<ThreadRow>,
     known_workspace_cwds: HashSet<String>,
@@ -477,6 +497,7 @@ struct AppShell {
     loading_selected_thread: bool,
     selected_thread_error: Option<(String, Entity<TextViewState>)>,
     inflight_threads: HashSet<String>,
+    active_turn_id_by_thread: HashMap<String, String>,
     pending_new_thread: bool,
     composing_new_thread_cwd: Option<String>,
     streaming_message_ix: Option<usize>,
@@ -499,8 +520,11 @@ struct AppShell {
     approval_selected_ix: usize,
     thread_token_usage: Option<ThreadTokenUsage>,
     attached_images: Vec<PathBuf>,
+    branch_diff_focus_handle: FocusHandle,
     skill_picker_scroll_handle: ScrollHandle,
     file_picker_scroll_handle: ScrollHandle,
+    branch_diff_scroll_handle: ScrollHandle,
+    branch_diff_file_list_scroll_handle: ScrollHandle,
     scroll_handle: ScrollHandle,
     input_state: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -570,6 +594,13 @@ impl AppShell {
             login_url: None,
             loading_threads: false,
             sidebar_collapsed: false,
+            branch_diff_sidebar_open: false,
+            branch_diff_loading: false,
+            branch_diff_needs_refresh: false,
+            branch_diff_snapshot: None,
+            branch_diff_error: None,
+            branch_diff_selected_path: None,
+            branch_diff_panel_width: px(420.),
             thread_error,
             threads,
             known_workspace_cwds,
@@ -582,6 +613,7 @@ impl AppShell {
             loading_selected_thread: false,
             selected_thread_error: None,
             inflight_threads: HashSet::new(),
+            active_turn_id_by_thread: HashMap::new(),
             pending_new_thread: false,
             composing_new_thread_cwd: None,
             streaming_message_ix: None,
@@ -604,8 +636,11 @@ impl AppShell {
             approval_selected_ix: 0,
             thread_token_usage: None,
             attached_images: Vec::new(),
+            branch_diff_focus_handle: cx.focus_handle(),
             skill_picker_scroll_handle: ScrollHandle::new(),
             file_picker_scroll_handle: ScrollHandle::new(),
+            branch_diff_scroll_handle: ScrollHandle::new(),
+            branch_diff_file_list_scroll_handle: ScrollHandle::new(),
             scroll_handle: ScrollHandle::new(),
             input_state,
             _subscriptions,
@@ -1006,6 +1041,266 @@ impl AppShell {
         files.sort_unstable_by_key(|path| path.to_ascii_lowercase());
         files.dedup();
         files
+    }
+
+    fn git_output(cwd: &Path, args: &[&str]) -> Result<String, String> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .map_err(|error| format!("failed to run git {}: {error}", args.join(" ")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("exit code {}", output.status)
+            } else {
+                stderr
+            };
+            return Err(format!("git {} failed: {detail}", args.join(" ")));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn git_ref_exists(cwd: &Path, reference: &str) -> bool {
+        Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", reference])
+            .current_dir(cwd)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn make_placeholder_added_file_diff(path: &str, message: &str) -> diff_view::ParsedFileDiff {
+        diff_view::ParsedFileDiff {
+            path: path.to_string(),
+            additions: 1,
+            deletions: 0,
+            rows: vec![
+                diff_view::DiffRow::HunkHeader(diff_view::HunkHeaderRow {
+                    raw: "@@ -0,0 +1 @@".to_string(),
+                }),
+                diff_view::DiffRow::Line(diff_view::DiffLineRow {
+                    kind: diff_view::DiffLineKind::Added,
+                    old_lineno: None,
+                    new_lineno: Some(1),
+                    text: message.to_string(),
+                }),
+            ],
+        }
+    }
+
+    fn make_untracked_file_diff(path: &str, content: &str) -> diff_view::ParsedFileDiff {
+        let content_lines = content.lines().collect::<Vec<_>>();
+        let mut rows = Vec::with_capacity(content_lines.len().saturating_add(1));
+        rows.push(diff_view::DiffRow::HunkHeader(diff_view::HunkHeaderRow {
+            raw: format!("@@ -0,0 +1,{} @@", content_lines.len()),
+        }));
+
+        rows.extend(content_lines.iter().enumerate().map(|(ix, line)| {
+            diff_view::DiffRow::Line(diff_view::DiffLineRow {
+                kind: diff_view::DiffLineKind::Added,
+                old_lineno: None,
+                new_lineno: Some((ix as u32).saturating_add(1)),
+                text: (*line).to_string(),
+            })
+        }));
+
+        diff_view::ParsedFileDiff {
+            path: path.to_string(),
+            additions: content_lines.len(),
+            deletions: 0,
+            rows,
+        }
+    }
+
+    fn load_untracked_file_diff(cwd: &Path, path: &str) -> diff_view::ParsedFileDiff {
+        let full_path = cwd.join(path);
+        let Ok(metadata) = fs::metadata(&full_path) else {
+            return Self::make_placeholder_added_file_diff(path, "[unable to read file metadata]");
+        };
+
+        if !metadata.is_file() {
+            return Self::make_placeholder_added_file_diff(path, "[not a regular file]");
+        }
+
+        if metadata.len() > 500_000 {
+            return Self::make_placeholder_added_file_diff(path, "[file too large to render]");
+        }
+
+        let Ok(bytes) = fs::read(&full_path) else {
+            return Self::make_placeholder_added_file_diff(path, "[unable to read file]");
+        };
+
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            return Self::make_placeholder_added_file_diff(path, "[binary file]");
+        };
+
+        Self::make_untracked_file_diff(path, content)
+    }
+
+    fn collect_branch_diff_snapshot(cwd: &str) -> Result<BranchDiffSnapshot, String> {
+        let root = PathBuf::from(cwd);
+        if cwd.trim().is_empty() {
+            return Err("No active workspace selected.".to_string());
+        }
+        if !root.is_dir() {
+            return Err(format!("Workspace path is not a directory: {cwd}"));
+        }
+
+        let is_work_tree = Self::git_output(&root, &["rev-parse", "--is-inside-work-tree"])?
+            .trim()
+            .eq("true");
+        if !is_work_tree {
+            return Err(format!("Workspace is not a git repository: {cwd}"));
+        }
+
+        let branch_name = Self::git_output(&root, &["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string();
+        let branch_name = if branch_name.is_empty() {
+            "HEAD".to_string()
+        } else {
+            branch_name
+        };
+
+        let diff_args = if Self::git_ref_exists(&root, "HEAD") {
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--find-renames",
+                "--no-color",
+                "--patch",
+                "--relative",
+                "HEAD",
+                "--",
+            ]
+        } else {
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--find-renames",
+                "--no-color",
+                "--patch",
+                "--relative",
+                "--cached",
+                "--",
+            ]
+        };
+        let diff_text = Self::git_output(&root, &diff_args)?;
+        let mut file_diffs = diff_view::parse_multi_file_unified_diff(&diff_text);
+
+        let untracked_output =
+            Self::git_output(&root, &["ls-files", "--others", "--exclude-standard"])?;
+        let mut known_paths = file_diffs
+            .iter()
+            .map(|file_diff| file_diff.path.clone())
+            .collect::<HashSet<_>>();
+        for path in untracked_output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            if known_paths.insert(path.to_string()) {
+                file_diffs.push(Self::load_untracked_file_diff(&root, path));
+            }
+        }
+
+        file_diffs.sort_unstable_by_key(|diff| diff.path.to_ascii_lowercase());
+        let total_additions = file_diffs.iter().map(|file| file.additions).sum();
+        let total_deletions = file_diffs.iter().map(|file| file.deletions).sum();
+
+        Ok(BranchDiffSnapshot {
+            cwd: cwd.to_string(),
+            branch_name,
+            base_ref: "working tree".to_string(),
+            file_diffs,
+            total_additions,
+            total_deletions,
+        })
+    }
+
+    fn fetch_branch_diff_for_cwd(&mut self, cwd: String, cx: &mut Context<Self>) {
+        self.branch_diff_loading = true;
+        self.branch_diff_error = None;
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let result = Self::collect_branch_diff_snapshot(&cwd);
+            let _ = view.update(cx, |view, cx| {
+                view.branch_diff_loading = false;
+                view.branch_diff_needs_refresh = false;
+                match result {
+                    Ok(snapshot) => {
+                        view.branch_diff_error = None;
+                        view.branch_diff_selected_path = view
+                            .branch_diff_selected_path
+                            .as_ref()
+                            .filter(|selected| {
+                                snapshot
+                                    .file_diffs
+                                    .iter()
+                                    .any(|file_diff| &file_diff.path == *selected)
+                            })
+                            .cloned()
+                            .or_else(|| {
+                                snapshot
+                                    .file_diffs
+                                    .first()
+                                    .map(|file_diff| file_diff.path.clone())
+                            });
+                        view.branch_diff_snapshot = Some(snapshot);
+                    }
+                    Err(error) => {
+                        view.branch_diff_snapshot = None;
+                        view.branch_diff_error = Some(error);
+                        view.branch_diff_selected_path = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn maybe_refresh_branch_diff(&mut self, cx: &mut Context<Self>) {
+        if !self.is_authenticated {
+            return;
+        }
+
+        if !self.branch_diff_sidebar_open {
+            return;
+        }
+
+        let cwd = self.active_composer_cwd();
+        if cwd.trim().is_empty() {
+            self.branch_diff_loading = false;
+            self.branch_diff_snapshot = None;
+            self.branch_diff_error = Some("Select a workspace to load changes.".to_string());
+            self.branch_diff_selected_path = None;
+            return;
+        }
+
+        if self.branch_diff_loading {
+            return;
+        }
+
+        let loaded_for_cwd = self
+            .branch_diff_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.cwd == cwd);
+        if loaded_for_cwd && !self.branch_diff_needs_refresh {
+            return;
+        }
+
+        self.fetch_branch_diff_for_cwd(cwd, cx);
+    }
+
+    fn request_branch_diff_refresh(&mut self, cx: &mut Context<Self>) {
+        self.branch_diff_needs_refresh = true;
+        self.maybe_refresh_branch_diff(cx);
     }
 
     fn set_active_skills_for_cwd(&mut self, cwd: &str) {
@@ -2287,6 +2582,9 @@ impl AppShell {
         if self.selected_thread_loaded_from_api_id.as_deref() == Some(selected_thread_id.as_str()) {
             return;
         }
+        if self.inflight_threads.contains(&selected_thread_id) {
+            return;
+        }
 
         self.loading_selected_thread = true;
         cx.notify();
@@ -2398,6 +2696,77 @@ impl AppShell {
         }
     }
 
+    fn selected_thread_active_turn_id(&self) -> Option<&str> {
+        self.selected_thread_id.as_deref().and_then(|thread_id| {
+            self.active_turn_id_by_thread
+                .get(thread_id)
+                .map(String::as_str)
+        })
+    }
+
+    fn value_as_non_empty_id(value: Option<&Value>) -> Option<String> {
+        match value {
+            Some(Value::String(id)) if !id.trim().is_empty() => Some(id.clone()),
+            Some(Value::Number(id)) => Some(id.to_string()),
+            _ => None,
+        }
+    }
+
+    fn extract_turn_id(value: &Value) -> Option<String> {
+        Self::value_as_non_empty_id(value.get("turnId")).or_else(|| {
+            value
+                .get("turn")
+                .and_then(|turn| Self::value_as_non_empty_id(turn.get("id")))
+        })
+    }
+
+    fn resolve_notification_thread_id(
+        &self,
+        explicit_thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> Option<String> {
+        if let Some(thread_id) = explicit_thread_id.filter(|thread_id| !thread_id.trim().is_empty())
+        {
+            return Some(thread_id.to_string());
+        }
+
+        if let Some(turn_id) = turn_id.filter(|turn_id| !turn_id.trim().is_empty())
+            && let Some((thread_id, _)) = self
+                .active_turn_id_by_thread
+                .iter()
+                .find(|(_, active_turn_id)| active_turn_id.as_str() == turn_id)
+        {
+            return Some(thread_id.clone());
+        }
+
+        if let Some(selected_thread_id) = self.selected_thread_id.as_deref()
+            && (self.inflight_threads.contains(selected_thread_id)
+                || self
+                    .active_turn_id_by_thread
+                    .contains_key(selected_thread_id))
+        {
+            return Some(selected_thread_id.to_string());
+        }
+
+        if self.inflight_threads.len() == 1
+            && let Some(thread_id) = self.inflight_threads.iter().next()
+        {
+            return Some(thread_id.clone());
+        }
+
+        None
+    }
+
+    fn can_steer_selected_turn(&self) -> bool {
+        self.selected_thread_id.is_some() && self.selected_thread_active_turn_id().is_some()
+    }
+
+    fn has_interrupt_ids(&self) -> bool {
+        self.selected_thread_id
+            .as_deref()
+            .is_some_and(|tid| self.active_turn_id_by_thread.contains_key(tid))
+    }
+
     fn has_pending_approval(&self) -> bool {
         !self.pending_approvals.is_empty()
     }
@@ -2434,6 +2803,55 @@ impl AppShell {
             next = 0;
         }
         self.approval_selected_ix = next as usize;
+        true
+    }
+
+    fn move_branch_diff_file_selection(&mut self, delta: isize) -> bool {
+        let Some(snapshot) = self.branch_diff_snapshot.as_ref() else {
+            return false;
+        };
+        if snapshot.file_diffs.is_empty() {
+            return false;
+        }
+
+        let len = snapshot.file_diffs.len() as isize;
+        let current = self
+            .branch_diff_selected_path
+            .as_ref()
+            .and_then(|selected| {
+                snapshot
+                    .file_diffs
+                    .iter()
+                    .position(|file_diff| &file_diff.path == selected)
+            })
+            .map(|ix| ix as isize);
+
+        let next = if let Some(current_ix) = current {
+            let mut next_ix = current_ix + delta;
+            if next_ix < 0 {
+                next_ix = len - 1;
+            } else if next_ix >= len {
+                next_ix = 0;
+            }
+            next_ix as usize
+        } else if delta < 0 {
+            (len - 1) as usize
+        } else {
+            0
+        };
+
+        let next_path = snapshot.file_diffs[next].path.clone();
+        if self
+            .branch_diff_selected_path
+            .as_ref()
+            .is_some_and(|selected| selected == &next_path)
+        {
+            return false;
+        }
+
+        self.branch_diff_selected_path = Some(next_path);
+        self.branch_diff_file_list_scroll_handle
+            .scroll_to_item(next);
         true
     }
 
@@ -2876,6 +3294,12 @@ impl AppShell {
         self.known_workspace_cwds.clear();
         self.expanded_workspace_groups.clear();
         self.expanded_workspace_threads.clear();
+        self.branch_diff_sidebar_open = false;
+        self.branch_diff_loading = false;
+        self.branch_diff_needs_refresh = false;
+        self.branch_diff_snapshot = None;
+        self.branch_diff_error = None;
+        self.branch_diff_selected_path = None;
         self.selected_thread_id = None;
         self.selected_thread_title = None;
         self.selected_thread_messages.clear();
@@ -2884,6 +3308,7 @@ impl AppShell {
         self.loading_selected_thread = false;
         self.selected_thread_error = None;
         self.inflight_threads.clear();
+        self.active_turn_id_by_thread.clear();
         self.pending_new_thread = false;
         self.composing_new_thread_cwd = None;
         self.streaming_message_ix = None;
@@ -3305,7 +3730,12 @@ impl AppShell {
         }
 
         let notification_thread_id = notification.params.get("threadId").and_then(Value::as_str);
-        let applies_to_selected_thread = match notification_thread_id {
+        let notification_turn_id = Self::extract_turn_id(&notification.params);
+        let resolved_thread_id = self.resolve_notification_thread_id(
+            notification_thread_id,
+            notification_turn_id.as_deref(),
+        );
+        let applies_to_selected_thread = match resolved_thread_id.as_deref() {
             Some(thread_id) => self.selected_thread_id.as_deref() == Some(thread_id),
             None => true,
         };
@@ -3385,18 +3815,42 @@ impl AppShell {
                 {
                     self.upsert_live_tool_message(item_id, tool_message, cx);
                 }
+                if let Some(item_type) = notification
+                    .params
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    && matches!(item_type, "commandExecution" | "fileChange")
+                {
+                    self.branch_diff_needs_refresh = true;
+                }
+            }
+            "turn/started" => {
+                if let Some(thread_id) = resolved_thread_id.as_deref() {
+                    self.inflight_threads.insert(thread_id.to_string());
+                    if let Some(turn_id) = notification_turn_id.as_deref() {
+                        self.active_turn_id_by_thread
+                            .insert(thread_id.to_string(), turn_id.to_string());
+                    }
+                }
+                if applies_to_selected_thread {
+                    self.selected_thread_error = None;
+                }
             }
             "turn/completed" => {
-                if let Some(thread_id) = notification_thread_id {
+                if let Some(thread_id) = resolved_thread_id.as_deref() {
                     self.inflight_threads.remove(thread_id);
+                    self.active_turn_id_by_thread.remove(thread_id);
                 } else if let Some(selected_thread_id) = self.selected_thread_id.as_deref() {
                     self.inflight_threads.remove(selected_thread_id);
+                    self.active_turn_id_by_thread.remove(selected_thread_id);
                 } else {
                     self.pending_new_thread = false;
                 }
 
                 if applies_to_selected_thread {
                     self.streaming_message_ix = None;
+                    self.branch_diff_needs_refresh = true;
 
                     if let Some(turn) = notification.params.get("turn")
                         && let Some(error) = turn.get("error")
@@ -3515,6 +3969,617 @@ impl AppShell {
             let days = diff / 86400;
             format!("{days}d")
         }
+    }
+
+    fn file_diff_line_number_column_width(file_diff: &diff_view::ParsedFileDiff) -> f32 {
+        let max_lineno = file_diff
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                diff_view::DiffRow::Line(line) => line.old_lineno.max(line.new_lineno),
+                diff_view::DiffRow::HunkHeader(_) => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let line_number_digits = max_lineno.max(1).to_string().len() as f32;
+        (line_number_digits * 9. + 16.).max(44.)
+    }
+
+    fn render_file_diff_cards(
+        file_diffs: &[diff_view::ParsedFileDiff],
+        text_color: gpui::Hsla,
+        subtext_color: gpui::Hsla,
+        surface0: gpui::Hsla,
+        surface1: gpui::Hsla,
+        mantle: gpui::Hsla,
+        green_color: gpui::Hsla,
+        red_color: gpui::Hsla,
+        font_mono: &gpui::SharedString,
+    ) -> Vec<gpui::AnyElement> {
+        let added_bg = gpui::Hsla {
+            a: 0.12,
+            ..green_color
+        };
+        let removed_bg = gpui::Hsla {
+            a: 0.12,
+            ..red_color
+        };
+
+        file_diffs
+            .iter()
+            .map(|file_diff| {
+                let total_add = file_diff.additions;
+                let total_del = file_diff.deletions;
+                let path = file_diff.path.clone();
+                let horizontal_scroll_id = format!("file-diff-lines-scroll-{}", file_diff.path);
+                let line_number_column_width = Self::file_diff_line_number_column_width(file_diff);
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(surface1)
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .w_full()
+                            .px(px(12.))
+                            .py(px(8.))
+                            .bg(mantle)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family(font_mono.clone())
+                                    .text_color(text_color)
+                                    .child(path),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .text_color(green_color)
+                                            .child(format!("+{total_add}")),
+                                    )
+                                    .child(
+                                        div().text_color(red_color).child(format!("-{total_del}")),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(horizontal_scroll_id)
+                            .w_full()
+                            .overflow_x_scroll()
+                            .map(|mut this| {
+                                // Keep wheel scrolling vertical unless horizontal intent is explicit.
+                                this.style().restrict_scroll_to_axis = Some(true);
+                                this
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .min_w_full()
+                                    .font_family(font_mono.clone())
+                                    .text_sm()
+                                    .children(file_diff.rows.iter().map(|row| {
+                                        match row {
+                                            diff_view::DiffRow::HunkHeader(h) => div()
+                                                .w_full()
+                                                .px(px(12.))
+                                                .py(px(4.))
+                                                .bg(surface0)
+                                                .text_color(subtext_color)
+                                                .text_xs()
+                                                .whitespace_nowrap()
+                                                .child(h.raw.clone())
+                                                .into_any_element(),
+                                            diff_view::DiffRow::Line(line) => {
+                                                let (row_bg, bar_color) = match line.kind {
+                                                    diff_view::DiffLineKind::Added => {
+                                                        (added_bg, green_color)
+                                                    }
+                                                    diff_view::DiffLineKind::Removed => {
+                                                        (removed_bg, red_color)
+                                                    }
+                                                    diff_view::DiffLineKind::Context => (
+                                                        gpui::Hsla::transparent_black(),
+                                                        gpui::Hsla::transparent_black(),
+                                                    ),
+                                                };
+                                                let old_ln = line.old_lineno.map_or_else(
+                                                    || "\u{00A0}".to_string(),
+                                                    |n| n.to_string(),
+                                                );
+                                                let new_ln = line.new_lineno.map_or_else(
+                                                    || "\u{00A0}".to_string(),
+                                                    |n| n.to_string(),
+                                                );
+                                                let display_text = if line.text.is_empty() {
+                                                    "\u{00A0}".to_string()
+                                                } else {
+                                                    line.text.replace(' ', "\u{00A0}")
+                                                };
+
+                                                div()
+                                                    .min_w_full()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .bg(row_bg)
+                                                    .child(div().w(px(3.)).h_full().bg(bar_color))
+                                                    .child(
+                                                        div()
+                                                            .w(px(line_number_column_width))
+                                                            .flex_shrink_0()
+                                                            .px(px(6.))
+                                                            .py(px(1.))
+                                                            .text_color(subtext_color)
+                                                            .text_right()
+                                                            .whitespace_nowrap()
+                                                            .child(old_ln),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(line_number_column_width))
+                                                            .flex_shrink_0()
+                                                            .px(px(6.))
+                                                            .py(px(1.))
+                                                            .text_color(subtext_color)
+                                                            .text_right()
+                                                            .whitespace_nowrap()
+                                                            .child(new_ln),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .px(px(8.))
+                                                            .py(px(1.))
+                                                            .text_color(text_color)
+                                                            .whitespace_nowrap()
+                                                            .child(display_text),
+                                                    )
+                                                    .into_any_element()
+                                            }
+                                        }
+                                    })),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    fn render_branch_diff_panel(
+        &self,
+        text_color: gpui::Hsla,
+        subtext_color: gpui::Hsla,
+        overlay_color: gpui::Hsla,
+        surface0: gpui::Hsla,
+        surface1: gpui::Hsla,
+        mantle: gpui::Hsla,
+        divider_color: gpui::Hsla,
+        red_color: gpui::Hsla,
+        green_color: gpui::Hsla,
+        font_mono: &gpui::SharedString,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let snapshot = self.branch_diff_snapshot.clone();
+        let branch_diff_error = self.branch_diff_error.clone();
+        let branch_diff_loading = self.branch_diff_loading;
+        let selected_path = self.branch_diff_selected_path.clone();
+        let font_mono = font_mono.clone();
+
+        div()
+            .relative()
+            .track_focus(&self.branch_diff_focus_handle)
+            .w(self.branch_diff_panel_width)
+            .h_full()
+            .flex_shrink_0()
+            .bg(mantle)
+            .flex()
+            .flex_col()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|view, _, window, cx| {
+                    view.branch_diff_focus_handle.focus(window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .id("branch-diff-resize-handle")
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(-3.))
+                    .h_full()
+                    .w(px(6.))
+                    .cursor_col_resize()
+                    .occlude()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|_, _, _, cx| {
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_drag(DraggedBranchDiffSidebarResize, |drag, _, _, cx| {
+                        cx.new(|_| drag.clone())
+                    }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .h(px(52.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(text_color)
+                                    .child("Workspace changes"),
+                            )
+                            .child({
+                                if let Some(snapshot) = &snapshot {
+                                    div()
+                                        .text_xs()
+                                        .text_color(subtext_color)
+                                        .child(format!(
+                                            "{} · {}",
+                                            snapshot.branch_name, snapshot.base_ref
+                                        ))
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .text_xs()
+                                        .text_color(subtext_color)
+                                        .child("Uncommitted changes")
+                                        .into_any_element()
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .id("branch-diff-refresh-button")
+                                    .h(px(28.))
+                                    .px(px(10.))
+                                    .rounded(px(999.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(if branch_diff_loading {
+                                        subtext_color
+                                    } else {
+                                        text_color
+                                    })
+                                    .bg(if branch_diff_loading {
+                                        surface0
+                                    } else {
+                                        gpui::Hsla::transparent_black()
+                                    })
+                                    .when(!branch_diff_loading, |this| {
+                                        this.hover(|this| this.bg(surface0)).on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |view, _, _, cx| {
+                                                view.request_branch_diff_refresh(cx);
+                                                cx.notify();
+                                            }),
+                                        )
+                                    })
+                                    .child("Refresh"),
+                            )
+                            .child(
+                                div()
+                                    .id("branch-diff-close-button")
+                                    .h(px(28.))
+                                    .w(px(28.))
+                                    .rounded(px(999.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(surface0))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |view, _, _, cx| {
+                                            view.branch_diff_sidebar_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(
+                                        Icon::new(IconName::PanelRightClose)
+                                            .size(px(16.))
+                                            .text_color(overlay_color),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(div().w_full().h(px(1.)).bg(divider_color))
+            .child(div().flex_1().min_h_0().px(px(12.)).py(px(12.)).child(
+                if branch_diff_loading && snapshot.is_none() {
+                    div()
+                        .text_sm()
+                        .text_color(subtext_color)
+                        .child("Loading workspace changes...")
+                        .into_any_element()
+                } else if let Some(error) = branch_diff_error {
+                    div()
+                        .w_full()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(surface1)
+                        .bg(surface0)
+                        .px(px(10.))
+                        .py(px(8.))
+                        .text_sm()
+                        .text_color(red_color)
+                        .child(error)
+                        .into_any_element()
+                } else if let Some(snapshot) = snapshot {
+                    if snapshot.file_diffs.is_empty() {
+                        div()
+                            .w_full()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(surface1)
+                            .bg(surface0)
+                            .px(px(10.))
+                            .py(px(8.))
+                            .text_sm()
+                            .text_color(subtext_color)
+                            .child("No uncommitted changes.")
+                            .into_any_element()
+                    } else {
+                        let file_count = snapshot.file_diffs.len();
+                        let file_label = if file_count == 1 {
+                            "1 file".to_string()
+                        } else {
+                            format!("{file_count} files")
+                        };
+                        let selected_path = selected_path
+                            .filter(|path| {
+                                snapshot
+                                    .file_diffs
+                                    .iter()
+                                    .any(|file_diff| file_diff.path == *path)
+                            })
+                            .or_else(|| {
+                                snapshot
+                                    .file_diffs
+                                    .first()
+                                    .map(|file_diff| file_diff.path.clone())
+                            });
+                        let selected_file = selected_path.as_ref().and_then(|path| {
+                            snapshot
+                                .file_diffs
+                                .iter()
+                                .find(|file_diff| &file_diff.path == path)
+                                .cloned()
+                        });
+
+                        div()
+                            .w_full()
+                            .h_full()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .rounded(px(8.))
+                                    .border_1()
+                                    .border_color(surface1)
+                                    .bg(surface0)
+                                    .px(px(10.))
+                                    .py(px(8.))
+                                    .text_sm()
+                                    .text_color(subtext_color)
+                                    .child(format!(
+                                        "{} · +{} -{}",
+                                        file_label,
+                                        snapshot.total_additions,
+                                        snapshot.total_deletions
+                                    ))
+                                    .child(div().mt(px(4.)).text_xs().child(snapshot.cwd.clone())),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .rounded(px(8.))
+                                    .border_1()
+                                    .border_color(surface1)
+                                    .bg(surface0)
+                                    .overflow_hidden()
+                                    .flex()
+                                    .child(
+                                        div()
+                                            .id("branch-diff-file-list-scroll")
+                                            .w(px(180.))
+                                            .min_w(px(140.))
+                                            .max_w(px(220.))
+                                            .h_full()
+                                            .min_h_0()
+                                            .overflow_y_scroll()
+                                            .track_scroll(&self.branch_diff_file_list_scroll_handle)
+                                            .py(px(6.))
+                                            .children(snapshot.file_diffs.iter().map(|file_diff| {
+                                                let path = file_diff.path.clone();
+                                                let select_path = path.clone();
+                                                let additions = file_diff.additions;
+                                                let deletions = file_diff.deletions;
+                                                let is_selected = selected_path
+                                                    .as_ref()
+                                                    .is_some_and(|selected| selected == &path);
+                                                div()
+                                                    .w_full()
+                                                    .min_w_0()
+                                                    .px(px(10.))
+                                                    .py(px(6.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(8.))
+                                                    .when(is_selected, |this| this.bg(mantle))
+                                                    .hover(|this| this.bg(mantle))
+                                                    .cursor_pointer()
+                                                    .on_mouse_down(
+                                                        gpui::MouseButton::Left,
+                                                        cx.listener(move |view, _, _, cx| {
+                                                            view.branch_diff_selected_path =
+                                                                Some(select_path.clone());
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .overflow_hidden()
+                                                            .text_ellipsis()
+                                                            .whitespace_nowrap()
+                                                            .text_xs()
+                                                            .text_color(text_color)
+                                                            .child(path),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(subtext_color)
+                                                            .child(format!(
+                                                                "+{} -{}",
+                                                                additions, deletions
+                                                            )),
+                                                    )
+                                            }))
+                                            .vertical_scrollbar(
+                                                &self.branch_diff_file_list_scroll_handle,
+                                            ),
+                                    )
+                                    .child(div().w(px(1.)).h_full().bg(surface1))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .min_h_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .h(px(36.))
+                                                    .px(px(10.))
+                                                    .border_b_1()
+                                                    .border_color(surface1)
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .overflow_hidden()
+                                                            .text_ellipsis()
+                                                            .whitespace_nowrap()
+                                                            .text_sm()
+                                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                                            .text_color(text_color)
+                                                            .child(
+                                                                selected_path
+                                                                    .clone()
+                                                                    .unwrap_or_else(|| {
+                                                                        "Select a file".to_string()
+                                                                    }),
+                                                            ),
+                                                    )
+                                                    .when_some(
+                                                        selected_file.clone(),
+                                                        |this, file_diff| {
+                                                            this.child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(subtext_color)
+                                                                    .child(format!(
+                                                                        "+{} -{}",
+                                                                        file_diff.additions,
+                                                                        file_diff.deletions
+                                                                    )),
+                                                            )
+                                                        },
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("branch-diff-scroll")
+                                                    .flex_1()
+                                                    .min_h_0()
+                                                    .overflow_y_scroll()
+                                                    .track_scroll(&self.branch_diff_scroll_handle)
+                                                    .px(px(10.))
+                                                    .py(px(10.))
+                                                    .child(if let Some(file_diff) = selected_file {
+                                                        let selected = vec![file_diff];
+                                                        div()
+                                                            .w_full()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap(px(12.))
+                                                            .children(Self::render_file_diff_cards(
+                                                                &selected,
+                                                                text_color,
+                                                                subtext_color,
+                                                                surface0,
+                                                                surface1,
+                                                                mantle,
+                                                                green_color,
+                                                                red_color,
+                                                                &font_mono,
+                                                            ))
+                                                            .into_any_element()
+                                                    } else {
+                                                        div()
+                                                            .text_sm()
+                                                            .text_color(subtext_color)
+                                                            .child(
+                                                                "Select a file to view its diff.",
+                                                            )
+                                                            .into_any_element()
+                                                    })
+                                                    .vertical_scrollbar(
+                                                        &self.branch_diff_scroll_handle,
+                                                    ),
+                                            ),
+                                    ),
+                            )
+                            .into_any_element()
+                    }
+                } else {
+                    div()
+                        .text_sm()
+                        .text_color(subtext_color)
+                        .child("No changes loaded yet.")
+                        .into_any_element()
+                },
+            ))
+            .into_any_element()
     }
 
     fn render_context_ring(
@@ -3781,10 +4846,45 @@ impl AppShell {
         (40., 40.)
     }
 
+    fn stop_streaming_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(server) = self._app_server.clone() else {
+            return;
+        };
+        let Some(thread_id) = self.selected_thread_id.clone() else {
+            return;
+        };
+        let Some(turn_id) = self.selected_thread_active_turn_id().map(str::to_string) else {
+            return;
+        };
+
+        cx.spawn(async move |view, cx| {
+            let result = server
+                .call(
+                    RequestMethod::TurnInterrupt,
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                    }),
+                )
+                .await;
+
+            let _ = view.update(cx, |view, cx| {
+                if let Err(error) = result
+                    && view.selected_thread_id.as_deref() == Some(thread_id.as_str())
+                {
+                    view.set_thread_error(format!("turn/interrupt failed: {error}"), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let text = text.trim().to_string();
-        if self.selected_thread_is_busy() || self.has_pending_approval() {
+        let waiting_for_response = self.selected_thread_is_busy();
+        if self.has_pending_approval() {
             return;
         }
 
@@ -3807,6 +4907,63 @@ impl AppShell {
             .collect::<Vec<_>>();
         if text.is_empty() && image_refs.is_empty() {
             self.attached_images = images;
+            return;
+        }
+
+        if waiting_for_response {
+            let Some(thread_id) = thread_id else {
+                self.attached_images = images;
+                return;
+            };
+            let Some(expected_turn_id) = self.selected_thread_active_turn_id().map(str::to_string)
+            else {
+                self.attached_images = images;
+                return;
+            };
+            if text.is_empty() {
+                self.attached_images = images;
+                return;
+            }
+
+            self.input_state.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+
+            self.selected_thread_messages
+                .push(Self::build_thread_message(
+                    ThreadSpeaker::User,
+                    text.clone(),
+                    image_refs,
+                    cx,
+                ));
+            self.streaming_message_ix = None;
+            cx.notify();
+
+            let skill_items = self.skill_input_items_for_text(&text);
+            let steer_input = Self::build_user_turn_input(&text, &images, skill_items);
+
+            cx.spawn(async move |view, cx| {
+                let result = server
+                    .call(
+                        RequestMethod::TurnSteer,
+                        json!({
+                            "threadId": thread_id,
+                            "input": steer_input,
+                            "expectedTurnId": expected_turn_id,
+                        }),
+                    )
+                    .await;
+
+                let _ = view.update(cx, |view, cx| {
+                    if let Err(error) = result
+                        && view.selected_thread_id.as_deref() == Some(thread_id.as_str())
+                    {
+                        view.set_thread_error(format!("turn/steer failed: {error}"), cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
             return;
         }
 
@@ -3919,13 +5076,18 @@ impl AppShell {
 
             let _ = view.update(cx, |view, cx| {
                 match result {
-                    Ok(_payload) => {
+                    Ok(payload) => {
+                        if let Some(turn_id) = Self::extract_turn_id(&payload) {
+                            view.active_turn_id_by_thread
+                                .insert(thread_id.clone(), turn_id);
+                        }
                         if view.selected_thread_id.as_deref() == Some(thread_id.as_str()) {
                             view.selected_thread_error = None;
                         }
                     }
                     Err(error) => {
                         view.inflight_threads.remove(thread_id.as_str());
+                        view.active_turn_id_by_thread.remove(thread_id.as_str());
                         if view.selected_thread_id.as_deref() == Some(thread_id.as_str()) {
                             view.set_thread_error(format!("turn/start failed: {error}"), cx);
                         }
@@ -3963,6 +5125,7 @@ impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_load_threads(cx);
         self.ensure_composer_options_for_active_workspace(cx);
+        self.maybe_refresh_branch_diff(cx);
         if self.is_authenticated {
             self.maybe_fetch_selected_thread_from_api(cx);
         }
@@ -3987,13 +5150,28 @@ impl Render for AppShell {
         });
         let waiting_for_response = self.selected_thread_is_busy();
         let show_streaming_status = waiting_for_response && !self.has_pending_approval();
-        let has_input = !self.input_state.read(cx).value().trim().is_empty()
-            || !self.attached_images.is_empty();
-        let can_send = has_input
-            && !waiting_for_response
+        let has_text_input = !self.input_state.read(cx).value().trim().is_empty();
+        let has_input = has_text_input || !self.attached_images.is_empty();
+        let can_send = if waiting_for_response {
+            has_text_input && self.can_steer_selected_turn()
+        } else {
+            has_input
+        };
+        let can_send = can_send
             && !self.has_pending_approval()
             && self.is_authenticated
             && self._app_server.is_some();
+        let show_stop_button = waiting_for_response && !has_text_input;
+        let stop_waiting_for_ids = show_stop_button
+            && !self.has_pending_approval()
+            && self.is_authenticated
+            && self._app_server.is_some()
+            && !self.has_interrupt_ids();
+        let can_stop = show_stop_button
+            && !self.has_pending_approval()
+            && self.is_authenticated
+            && self._app_server.is_some()
+            && self.has_interrupt_ids();
         let attached_images = self.attached_images.clone();
         let model_label = self.selected_model_label();
         let reasoning_label = self.selected_reasoning_label();
@@ -4356,14 +5534,27 @@ impl Render for AppShell {
                 );
         }
 
-        div()
+        let root = div()
             .size_full()
             .font_family(font_sans)
             .bg(sidebar_bg)
             .flex()
             .flex_row()
+            .flex_nowrap()
             .capture_action(cx.listener(|view, _: &InputMoveUp, window, cx| {
                 if view.has_pending_approval() && view.move_approval_selection(-1) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+
+                if view.current_skill_picker_state(cx).is_none()
+                    && view.current_file_picker_state(cx).is_none()
+                    && view.branch_diff_sidebar_open
+                    && view.branch_diff_focus_handle.is_focused(window)
+                    && view.move_branch_diff_file_selection(-1)
+                {
                     window.prevent_default();
                     cx.stop_propagation();
                     cx.notify();
@@ -4371,6 +5562,18 @@ impl Render for AppShell {
             }))
             .capture_action(cx.listener(|view, _: &InputMoveDown, window, cx| {
                 if view.has_pending_approval() && view.move_approval_selection(1) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+
+                if view.current_skill_picker_state(cx).is_none()
+                    && view.current_file_picker_state(cx).is_none()
+                    && view.branch_diff_sidebar_open
+                    && view.branch_diff_focus_handle.is_focused(window)
+                    && view.move_branch_diff_file_selection(1)
+                {
                     window.prevent_default();
                     cx.stop_propagation();
                     cx.notify();
@@ -4390,6 +5593,21 @@ impl Render for AppShell {
                 cx.stop_propagation();
                 view.prompt_add_workspace(cx);
             }))
+            .on_drag_move(cx.listener(
+                |view, event: &gpui::DragMoveEvent<DraggedBranchDiffSidebarResize>, _, cx| {
+                    if !view.branch_diff_sidebar_open {
+                        return;
+                    }
+                    let desired_width = event.bounds.right() - event.event.position.x;
+                    let min_width = px(280.);
+                    let max_width = max(event.bounds.size.width - px(320.), min_width);
+                    let clamped_width = min(max(desired_width, min_width), max_width);
+                    if view.branch_diff_panel_width != clamped_width {
+                        view.branch_diff_panel_width = clamped_width;
+                        cx.notify();
+                    }
+                },
+            ))
             .child(
                 Sidebar::<AnySidebarItem>::new("sidebar")
                     .w(px(300.))
@@ -4563,6 +5781,7 @@ impl Render for AppShell {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .h_full()
                     .bg(content_bg)
                     .flex()
@@ -4604,6 +5823,67 @@ impl Render for AppShell {
                                                 self.selected_thread_title
                                                     .clone()
                                                     .unwrap_or_else(|| "Thread".to_string()),
+                                            ),
+                                    )
+                            })
+                            .child({
+                                let branch_diff_sidebar_open = self.branch_diff_sidebar_open;
+                                let branch_diff_loading = self.branch_diff_loading;
+                                let branch_label = self
+                                    .branch_diff_snapshot
+                                    .as_ref()
+                                    .map(|snapshot| format!("{} changes", snapshot.branch_name))
+                                    .unwrap_or_else(|| "Changes".to_string());
+
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .when(branch_diff_loading, |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(subtext_color)
+                                                .child("Loading changes..."),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(subtext_color)
+                                            .child(branch_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("branch-diff-toggle-header")
+                                            .h(px(28.))
+                                            .w(px(28.))
+                                            .rounded(px(999.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(|this| this.bg(surface0))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(move |view, _, _, cx| {
+                                                    view.branch_diff_sidebar_open =
+                                                        !view.branch_diff_sidebar_open;
+                                                    if view.branch_diff_sidebar_open {
+                                                        view.branch_diff_needs_refresh = true;
+                                                        view.maybe_refresh_branch_diff(cx);
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(
+                                                Icon::new(if branch_diff_sidebar_open {
+                                                    IconName::PanelRightClose
+                                                } else {
+                                                    IconName::PanelRightOpen
+                                                })
+                                                .size(px(16.))
+                                                .text_color(overlay_color),
                                             ),
                                     )
                             }),
@@ -4864,9 +6144,6 @@ impl Render for AppShell {
                                                                 let total_files = file_diffs.len();
                                                                 let font_mono = font_mono.clone();
 
-                                                                let added_bg = gpui::Hsla { a: 0.12, ..green_color };
-                                                                let removed_bg = gpui::Hsla { a: 0.12, ..red_color };
-
                                                                 div()
                                                                     .w_full()
                                                                     .mb(px(10.))
@@ -4895,161 +6172,17 @@ impl Render for AppShell {
                                                                                                 .flex()
                                                                                                 .flex_col()
                                                                                                 .gap(px(12.))
-                                                                                                .children(
-                                                                                                    file_diffs.iter().map(|file_diff| {
-                                                                                                        let total_add = file_diff.additions;
-                                                                                                        let total_del = file_diff.deletions;
-                                                                                                        let path = file_diff.path.clone();
-                                                                                                        let font_mono = font_mono.clone();
-                                                                                                        let max_lineno = file_diff
-                                                                                                            .rows
-                                                                                                            .iter()
-                                                                                                            .filter_map(|row| match row {
-                                                                                                                diff_view::DiffRow::Line(line) => {
-                                                                                                                    line.old_lineno.max(line.new_lineno)
-                                                                                                                }
-                                                                                                                diff_view::DiffRow::HunkHeader(_) => None,
-                                                                                                            })
-                                                                                                            .max()
-                                                                                                            .unwrap_or(0);
-                                                                                                        let line_number_digits = max_lineno.max(1).to_string().len() as f32;
-                                                                                                        let line_number_column_width =
-                                                                                                            (line_number_digits * 9. + 16.).max(44.);
-
-                                                                                                        div()
-                                                                                                            .flex()
-                                                                                                            .flex_col()
-                                                                                                            .rounded(px(8.))
-                                                                                                            .border_1()
-                                                                                                            .border_color(surface1)
-                                                                                                            .overflow_hidden()
-                                                                                                            .child(
-                                                                                                                div()
-                                                                                                                    .w_full()
-                                                                                                                    .px(px(12.))
-                                                                                                                    .py(px(8.))
-                                                                                                                    .bg(surface0)
-                                                                                                                    .border_b_1()
-                                                                                                                    .border_color(surface1)
-                                                                                                                    .flex()
-                                                                                                                    .items_center()
-                                                                                                                    .gap(px(8.))
-                                                                                                                    .text_sm()
-                                                                                                                    .child(
-                                                                                                                        div()
-                                                                                                                            .font_family(font_mono.clone())
-                                                                                                                            .text_color(text_color)
-                                                                                                                            .child(path),
-                                                                                                                    )
-                                                                                                                    .child(
-                                                                                                                        div()
-                                                                                                                            .flex()
-                                                                                                                            .gap(px(6.))
-                                                                                                                            .child(
-                                                                                                                                div()
-                                                                                                                                    .text_color(green_color)
-                                                                                                                                    .child(format!("+{total_add}")),
-                                                                                                                            )
-                                                                                                                            .child(
-                                                                                                                                div()
-                                                                                                                                    .text_color(red_color)
-                                                                                                                                    .child(format!("-{total_del}")),
-                                                                                                                            ),
-                                                                                                                    ),
-                                                                                                            )
-                                                                                                            .child(
-                                                                                                                div()
-                                                                                                                    .w_full()
-                                                                                                                    .overflow_x_scrollbar()
-                                                                                                                    .child(
-                                                                                                                        div()
-                                                                                                                            .flex()
-                                                                                                                            .flex_col()
-                                                                                                                            .min_w_full()
-                                                                                                                            .font_family(font_mono.clone())
-                                                                                                                            .text_sm()
-                                                                                                                            .children(
-                                                                                                                                file_diff.rows.iter().map(|row| {
-                                                                                                                                    match row {
-                                                                                                                                        diff_view::DiffRow::HunkHeader(h) => {
-                                                                                                                                            div()
-                                                                                                                                                .w_full()
-                                                                                                                                                .px(px(12.))
-                                                                                                                                                .py(px(4.))
-                                                                                                                                                .bg(surface0)
-                                                                                                                                                .text_color(subtext_color)
-                                                                                                                                                .text_xs()
-                                                                                                                                                .whitespace_nowrap()
-                                                                                                                                                .child(h.raw.clone())
-                                                                                                                                                .into_any_element()
-                                                                                                                                        }
-                                                                                                                                        diff_view::DiffRow::Line(line) => {
-                                                                                                                                            let (row_bg, bar_color) = match line.kind {
-                                                                                                                                                diff_view::DiffLineKind::Added => (added_bg, green_color),
-                                                                                                                                                diff_view::DiffLineKind::Removed => (removed_bg, red_color),
-                                                                                                                                                diff_view::DiffLineKind::Context => (gpui::Hsla::transparent_black(), gpui::Hsla::transparent_black()),
-                                                                                                                                            };
-
-                                                                                                                                            let old_ln = line.old_lineno.map_or_else(|| "\u{00A0}".to_string(), |n| n.to_string());
-                                                                                                                                            let new_ln = line.new_lineno.map_or_else(|| "\u{00A0}".to_string(), |n| n.to_string());
-
-                                                                                                                                            let display_text = if line.text.is_empty() {
-                                                                                                                                                "\u{00A0}".to_string()
-                                                                                                                                            } else {
-                                                                                                                                                line.text.replace(' ', "\u{00A0}")
-                                                                                                                                            };
-
-                                                                                                                                            div()
-                                                                                                                                                .min_w_full()
-                                                                                                                                               .flex()
-                                                                                                                                               .flex_row()
-                                                                                                                                               .bg(row_bg)
-                                                                                                                                               .child(
-                                                                                                                                                   div()
-                                                                                                                                                        .w(px(3.))
-                                                                                                                                                        .h_full()
-                                                                                                                                                        .bg(bar_color),
-                                                                                                                                                )
-                                                                                                                                               .child(
-                                                                                                                                                   div()
-                                                                                                                                                        .w(px(line_number_column_width))
-                                                                                                                                                        .flex_shrink_0()
-                                                                                                                                                        .px(px(6.))
-                                                                                                                                                        .py(px(1.))
-                                                                                                                                                        .text_color(subtext_color)
-                                                                                                                                                        .text_right()
-                                                                                                                                                        .whitespace_nowrap()
-                                                                                                                                                        .child(old_ln),
-                                                                                                                                               )
-                                                                                                                                               .child(
-                                                                                                                                                   div()
-                                                                                                                                                        .w(px(line_number_column_width))
-                                                                                                                                                        .flex_shrink_0()
-                                                                                                                                                        .px(px(6.))
-                                                                                                                                                        .py(px(1.))
-                                                                                                                                                        .text_color(subtext_color)
-                                                                                                                                                        .text_right()
-                                                                                                                                                        .whitespace_nowrap()
-                                                                                                                                                        .child(new_ln),
-                                                                                                                                               )
-                                                                                                                                               .child(
-                                                                                                                                                   div()
-                                                                                                                                                        .flex_1()
-                                                                                                                                                        .px(px(8.))
-                                                                                                                                                        .py(px(1.))
-                                                                                                                                                        .text_color(text_color)
-                                                                                                                                                        .whitespace_nowrap()
-                                                                                                                                                        .child(display_text),
-                                                                                                                                               )
-                                                                                                                                               .into_any_element()
-                                                                                                                                        }
-                                                                                                                                    }
-                                                                                                                                }),
-                                                                                                                            ),
-                                                                                                                    ),
-                                                                                                            )
-                                                                                                    }),
-                                                                                                ),
+                                                                                                .children(Self::render_file_diff_cards(
+                                                                                                    &file_diffs,
+                                                                                                    text_color,
+                                                                                                    subtext_color,
+                                                                                                    surface0,
+                                                                                                    surface1,
+                                                                                                    mantle,
+                                                                                                    green_color,
+                                                                                                    red_color,
+                                                                                                    &font_mono,
+                                                                                                )),
                                                                                         )
                                                                                 })
                                                                                 .on_toggle_click(
@@ -5739,8 +6872,7 @@ impl Render for AppShell {
                                                     .h_full()
                                                     .text_color(text_color)
                                                     .disabled(
-                                                        waiting_for_response
-                                                            || self.has_pending_approval()
+                                                        self.has_pending_approval()
                                                             || self._app_server.is_none(),
                                                     ),
                                             ),
@@ -6001,41 +7133,118 @@ impl Render for AppShell {
                                                         },
                                                     )
                                                     .child(
-                                                        div()
-                                                            .size(px(34.))
-                                                            .rounded(px(999.))
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .bg(if can_send {
-                                                                blue_color
-                                                            } else {
-                                                                surface1
-                                                            })
-                                                            .when(can_send, |this| {
-                                                                this.cursor_pointer()
-                                                                    .on_mouse_down(
-                                                                        gpui::MouseButton::Left,
-                                                                        cx.listener(
-                                                                            |view, _, window, cx| {
-                                                                                view.send_message(
-                                                                                    window, cx,
-                                                                                );
-                                                                            },
-                                                                        ),
+                                                        if show_stop_button {
+                                                            if stop_waiting_for_ids {
+                                                                div()
+                                                                    .size(px(34.))
+                                                                    .rounded(px(999.))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .bg(surface1)
+                                                                    .child(
+                                                                        Icon::new(IconName::LoaderCircle)
+                                                                            .size(px(18.))
+                                                                            .text_color(overlay_color)
+                                                                            .with_animation(
+                                                                                "stop-button-spinner",
+                                                                                Animation::new(Duration::from_secs(1))
+                                                                                    .repeat(),
+                                                                                |icon, delta| {
+                                                                                    icon.transform(
+                                                                                        Transformation::rotate(
+                                                                                            percentage(delta),
+                                                                                        ),
+                                                                                    )
+                                                                                },
+                                                                            ),
                                                                     )
-                                                            })
-                                                            .child(
-                                                                Icon::new(IconName::ArrowUp)
-                                                                    .size(px(20.))
-                                                                    .text_color(crust),
-                                                            ),
+                                                            } else {
+                                                                div()
+                                                                    .size(px(34.))
+                                                                    .rounded(px(999.))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .bg(if can_stop {
+                                                                        red_color
+                                                                    } else {
+                                                                        surface1
+                                                                    })
+                                                                    .when(can_stop, |this| {
+                                                                        this.cursor_pointer()
+                                                                            .on_mouse_down(
+                                                                                gpui::MouseButton::Left,
+                                                                                cx.listener(
+                                                                                    |view, _, _, cx| {
+                                                                                        view.stop_streaming_turn(
+                                                                                            cx,
+                                                                                        );
+                                                                                    },
+                                                                                ),
+                                                                            )
+                                                                    })
+                                                                    .child(
+                                                                        Icon::new(IconName::Close)
+                                                                            .size(px(18.))
+                                                                            .text_color(crust),
+                                                                    )
+                                                            }
+                                                        } else {
+                                                            div()
+                                                                .size(px(34.))
+                                                                .rounded(px(999.))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .bg(if can_send {
+                                                                    blue_color
+                                                                } else {
+                                                                    surface1
+                                                                })
+                                                                .when(can_send, |this| {
+                                                                    this.cursor_pointer()
+                                                                        .on_mouse_down(
+                                                                            gpui::MouseButton::Left,
+                                                                            cx.listener(
+                                                                                |view, _, window, cx| {
+                                                                                    view.send_message(
+                                                                                        window, cx,
+                                                                                    );
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                })
+                                                                .child(
+                                                                    Icon::new(IconName::ArrowUp)
+                                                                        .size(px(20.))
+                                                                        .text_color(crust),
+                                                                )
+                                                        },
                                                     ),
                                             ),
                                     ),
                             ),
-                    ),
-            )
+                    ));
+
+        if self.branch_diff_sidebar_open {
+            root.child(div().w(px(1.)).h_full().bg(divider_color))
+                .child(self.render_branch_diff_panel(
+                    text_color,
+                    subtext_color,
+                    overlay_color,
+                    surface0,
+                    surface1,
+                    mantle,
+                    divider_color,
+                    red_color,
+                    green_color,
+                    &font_mono,
+                    cx,
+                ))
+        } else {
+            root
+        }
     }
 }
 
@@ -6099,6 +7308,8 @@ fn main() {
 
         cx.bind_keys([
             KeyBinding::new("shift-enter", InputEnter { secondary: true }, Some("Input")),
+            KeyBinding::new("up", InputMoveUp, None),
+            KeyBinding::new("down", InputMoveDown, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.set_menus(app_menus());
@@ -6350,6 +7561,22 @@ mod tests {
             json!({ "type": "localImage", "path": "/tmp/repo/screenshot.png" })
         );
         assert_eq!(turn_input[1], json!({ "type": "text", "text": "run ls" }));
+    }
+
+    #[test]
+    fn extract_turn_id_reads_turn_id_and_nested_turn_id_shapes() {
+        assert_eq!(
+            AppShell::extract_turn_id(&json!({ "turnId": "turn_123" })),
+            Some("turn_123".to_string())
+        );
+        assert_eq!(
+            AppShell::extract_turn_id(&json!({ "turn": { "id": "turn_456" } })),
+            Some("turn_456".to_string())
+        );
+        assert_eq!(
+            AppShell::extract_turn_id(&json!({ "turn": { "id": 7 } })),
+            Some("7".to_string())
+        );
     }
 
     #[test]
