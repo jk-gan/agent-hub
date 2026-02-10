@@ -7,8 +7,9 @@ mod theme;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -889,6 +890,46 @@ impl AppShell {
         Self::SKIPPED_FILE_PICKER_DIRS.contains(&name)
     }
 
+    fn collect_workspace_files_with_rg(root: &Path, max_files: usize) -> Option<Vec<String>> {
+        let mut child = Command::new("rg")
+            .arg("--files")
+            .current_dir(root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdout = child.stdout.take()?;
+        let reader = BufReader::new(stdout);
+        let mut files = Vec::new();
+        let mut reached_limit = false;
+
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            files.push(trimmed.replace('\\', "/"));
+            if files.len() >= max_files {
+                reached_limit = true;
+                break;
+            }
+        }
+
+        if reached_limit {
+            let _ = child.kill();
+            let _ = child.wait();
+        } else if !child.wait().ok()?.success() {
+            return None;
+        }
+
+        files.sort_unstable_by_key(|path| path.to_ascii_lowercase());
+        files.dedup();
+        Some(files)
+    }
+
     fn collect_workspace_files(cwd: &str, max_files: usize) -> Vec<String> {
         let root = PathBuf::from(cwd);
 
@@ -904,21 +945,7 @@ impl AppShell {
             return Vec::new();
         }
 
-        if let Ok(output) = Command::new("rg")
-            .arg("--files")
-            .current_dir(&root)
-            .output()
-            && output.status.success()
-        {
-            let mut files = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(|line| line.replace('\\', "/"))
-                .take(max_files)
-                .collect::<Vec<_>>();
-            files.sort_unstable_by_key(|path| path.to_ascii_lowercase());
-            files.dedup();
+        if let Some(files) = Self::collect_workspace_files_with_rg(&root, max_files) {
             return files;
         }
 
@@ -3148,14 +3175,65 @@ impl AppShell {
     }
 
     fn open_auth_url(url: &str) {
+        let trimmed = url.trim();
+        let allow_http_local = trimmed
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split(['/', '?', '#']).next())
+            .is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host.starts_with("localhost:")
+                    || host == "127.0.0.1"
+                    || host.starts_with("127.0.0.1:")
+            });
+        if !trimmed.starts_with("https://") && !allow_http_local {
+            eprintln!("refusing to open non-http(s) auth url: {trimmed}");
+            return;
+        }
+
         #[cfg(target_os = "macos")]
-        let _ = Command::new("open").arg(url).spawn();
+        let _ = Command::new("open").arg(trimmed).spawn();
 
         #[cfg(target_os = "linux")]
-        let _ = Command::new("xdg-open").arg(url).spawn();
+        let _ = Command::new("xdg-open").arg(trimmed).spawn();
 
         #[cfg(target_os = "windows")]
-        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "", trimmed])
+            .spawn();
+    }
+
+    fn write_clipboard_image_to_temp(bytes: &[u8], ext: &str) -> Option<PathBuf> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pid = std::process::id();
+
+        for attempt in 0..8 {
+            let tmp_path =
+                std::env::temp_dir().join(format!("agent-hub-paste-{pid}-{ts}-{attempt}.{ext}"));
+            let mut file = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    if error.kind() == ErrorKind::AlreadyExists {
+                        continue;
+                    }
+                    return None;
+                }
+            };
+
+            if file.write_all(bytes).is_ok() {
+                return Some(tmp_path);
+            }
+
+            let _ = fs::remove_file(&tmp_path);
+        }
+
+        None
     }
 
     fn maybe_load_threads(&mut self, cx: &mut Context<Self>) {
@@ -3620,12 +3698,7 @@ impl AppShell {
                         ImageFormat::Tiff => "tiff",
                         ImageFormat::Ico => "ico",
                     };
-                    let ts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
-                    let tmp_path = std::env::temp_dir().join(format!("agent-hub-paste-{ts}.{ext}"));
-                    if fs::write(&tmp_path, &image.bytes).is_ok() {
+                    if let Some(tmp_path) = Self::write_clipboard_image_to_temp(&image.bytes, ext) {
                         self.add_image_attachment(tmp_path, cx);
                     }
                 }
@@ -3721,11 +3794,7 @@ impl AppShell {
     fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let text = text.trim().to_string();
-        let has_images = !self.attached_images.is_empty();
-        if (text.is_empty() && !has_images)
-            || self.selected_thread_is_busy()
-            || self.has_pending_approval()
-        {
+        if self.selected_thread_is_busy() || self.has_pending_approval() {
             return;
         }
 
@@ -3739,19 +3808,7 @@ impl AppShell {
         let cwd = self.active_composer_cwd();
         let selected_model = self.selected_model.clone();
         let selected_reasoning_effort = self.selected_reasoning_effort.clone();
-        if let Some(thread_id) = thread_id.as_deref() {
-            self.composing_new_thread_cwd = None;
-            self.inflight_threads.insert(thread_id.to_string());
-        } else {
-            self.pending_new_thread = true;
-        }
-
         let images = std::mem::take(&mut self.attached_images);
-
-        self.input_state.update(cx, |state, cx| {
-            state.set_value("", window, cx);
-        });
-
         let image_refs = images
             .iter()
             .filter_map(|path| path.to_str())
@@ -3759,8 +3816,20 @@ impl AppShell {
             .filter(|path| !path.is_empty())
             .collect::<Vec<_>>();
         if text.is_empty() && image_refs.is_empty() {
+            self.attached_images = images;
             return;
         }
+
+        if let Some(thread_id) = thread_id.as_deref() {
+            self.composing_new_thread_cwd = None;
+            self.inflight_threads.insert(thread_id.to_string());
+        } else {
+            self.pending_new_thread = true;
+        }
+
+        self.input_state.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
 
         self.selected_thread_messages
             .push(Self::build_thread_message(
