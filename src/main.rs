@@ -340,6 +340,14 @@ enum ThreadSpeaker {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct WebSearchDetails {
+    query: String,
+    action_type: String,
+    url: Option<String>,
+    queries: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum ThreadMessageKind {
     Text,
     CommandExecution {
@@ -350,6 +358,10 @@ enum ThreadMessageKind {
     FileChange {
         status_label: String,
         file_diffs: Vec<diff_view::ParsedFileDiff>,
+        expanded: bool,
+    },
+    WebSearch {
+        details: WebSearchDetails,
         expanded: bool,
     },
 }
@@ -378,6 +390,10 @@ enum RenderableMessage {
     FileChange {
         status_label: String,
         file_diffs: Vec<diff_view::ParsedFileDiff>,
+        expanded: bool,
+    },
+    WebSearch {
+        details: WebSearchDetails,
         expanded: bool,
     },
 }
@@ -2050,6 +2066,16 @@ impl AppShell {
                     },
                 }
             }
+            RenderableMessage::WebSearch { details, expanded } => {
+                let view_state = Self::new_message_state("", cx);
+                ThreadMessage {
+                    speaker: ThreadSpeaker::Assistant,
+                    content: String::new(),
+                    image_refs: Vec::new(),
+                    view_state,
+                    kind: ThreadMessageKind::WebSearch { details, expanded },
+                }
+            }
         }
     }
 
@@ -2060,6 +2086,95 @@ impl AppShell {
         raw.into_iter()
             .map(|message| Self::build_message_from_renderable(message, cx))
             .collect()
+    }
+
+    fn is_tool_renderable_message(message: &RenderableMessage) -> bool {
+        matches!(
+            message,
+            RenderableMessage::CommandExecution { .. }
+                | RenderableMessage::FileChange { .. }
+                | RenderableMessage::WebSearch { .. }
+        )
+    }
+
+    fn renderable_message_from_thread_message(message: &ThreadMessage) -> RenderableMessage {
+        match &message.kind {
+            ThreadMessageKind::Text => RenderableMessage::Text {
+                speaker: message.speaker,
+                content: message.content.clone(),
+                image_refs: message.image_refs.clone(),
+            },
+            ThreadMessageKind::CommandExecution {
+                header,
+                status_label,
+                expanded,
+            } => RenderableMessage::CommandExecution {
+                header: header.clone(),
+                status_label: status_label.clone(),
+                content: message.content.clone(),
+                expanded: *expanded,
+            },
+            ThreadMessageKind::FileChange {
+                status_label,
+                file_diffs,
+                expanded,
+            } => RenderableMessage::FileChange {
+                status_label: status_label.clone(),
+                file_diffs: file_diffs.clone(),
+                expanded: *expanded,
+            },
+            ThreadMessageKind::WebSearch { details, expanded } => RenderableMessage::WebSearch {
+                details: details.clone(),
+                expanded: *expanded,
+            },
+        }
+    }
+
+    fn renderable_messages_from_thread_messages(
+        messages: &[ThreadMessage],
+    ) -> Vec<RenderableMessage> {
+        messages
+            .iter()
+            .map(Self::renderable_message_from_thread_message)
+            .collect()
+    }
+
+    fn merge_resume_renderable_messages(
+        existing: Vec<RenderableMessage>,
+        fetched: Vec<RenderableMessage>,
+    ) -> Vec<RenderableMessage> {
+        if fetched.is_empty() && !existing.is_empty() {
+            return existing;
+        }
+
+        if fetched.iter().any(Self::is_tool_renderable_message) {
+            return fetched;
+        }
+
+        let mut non_tool_count = 0usize;
+        let mut preserved_tools = Vec::new();
+        for message in existing {
+            if Self::is_tool_renderable_message(&message) {
+                preserved_tools.push((non_tool_count, message));
+            } else {
+                non_tool_count += 1;
+            }
+        }
+
+        if preserved_tools.is_empty() {
+            return fetched;
+        }
+
+        let mut merged = fetched;
+        let mut inserted = 0usize;
+        for (anchor_non_tool_count, tool_message) in preserved_tools {
+            let insert_ix = anchor_non_tool_count
+                .saturating_add(inserted)
+                .min(merged.len());
+            merged.insert(insert_ix, tool_message);
+            inserted += 1;
+        }
+        merged
     }
 
     fn reset_live_tool_message_state(&mut self) {
@@ -2121,6 +2236,21 @@ impl AppShell {
                 message.kind = ThreadMessageKind::FileChange {
                     status_label,
                     file_diffs,
+                    expanded: next_expanded,
+                };
+            }
+            RenderableMessage::WebSearch { details, expanded } => {
+                let next_expanded = match &message.kind {
+                    ThreadMessageKind::WebSearch { expanded, .. } => *expanded,
+                    _ => expanded,
+                };
+
+                message.speaker = ThreadSpeaker::Assistant;
+                message.content = String::new();
+                message.image_refs.clear();
+                message.view_state = Self::new_message_state("", cx);
+                message.kind = ThreadMessageKind::WebSearch {
+                    details,
                     expanded: next_expanded,
                 };
             }
@@ -2233,7 +2363,7 @@ impl AppShell {
         let raw_content = match &message {
             RenderableMessage::Text { content, .. } => content.as_str(),
             RenderableMessage::CommandExecution { content, .. } => content.as_str(),
-            RenderableMessage::FileChange { .. } => "",
+            RenderableMessage::FileChange { .. } | RenderableMessage::WebSearch { .. } => "",
         };
 
         if let RenderableMessage::Text {
@@ -2249,7 +2379,10 @@ impl AppShell {
         }
 
         let Some(content) = Self::budgeted_content(raw_content, used_chars, was_truncated) else {
-            if matches!(&message, RenderableMessage::FileChange { .. }) {
+            if matches!(
+                &message,
+                RenderableMessage::FileChange { .. } | RenderableMessage::WebSearch { .. }
+            ) {
                 messages.push(message);
             }
             return;
@@ -2277,6 +2410,7 @@ impl AppShell {
                 expanded,
             },
             file_change @ RenderableMessage::FileChange { .. } => file_change,
+            web_search @ RenderableMessage::WebSearch { .. } => web_search,
         };
         messages.push(message);
     }
@@ -2359,6 +2493,16 @@ impl AppShell {
             "failed" => "Failed".to_string(),
             "declined" => "Declined".to_string(),
             _ => status.to_string(),
+        }
+    }
+
+    fn web_search_action_label(action_type: &str) -> String {
+        match action_type {
+            "search" => "Searched".to_string(),
+            "openPage" => "Opened page".to_string(),
+            "findInPage" => "Searched in page".to_string(),
+            "other" | "unknown" => "Running".to_string(),
+            _ => action_type.to_string(),
         }
     }
 
@@ -2451,7 +2595,7 @@ impl AppShell {
         })
     }
 
-    fn format_web_search_item(item: &Value) -> Option<String> {
+    fn format_web_search_item(item: &Value) -> Option<RenderableMessage> {
         let mut query = item
             .get("query")
             .and_then(Value::as_str)
@@ -2475,38 +2619,44 @@ impl AppShell {
         {
             query = action_query.to_string();
         }
+
+        let queries = action
+            .and_then(|value| value.get("queries"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
         if query.is_empty()
-            && let Some(queries) = action
-                .and_then(|value| value.get("queries"))
-                .and_then(Value::as_array)
-            && let Some(first_query) = queries
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .find(|value| !value.is_empty())
+            && let Some(first_query) = queries.first()
         {
-            query = first_query.to_string();
+            query = first_query.clone();
         }
 
         let url = action
             .and_then(|value| value.get("url"))
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
 
-        if query.is_empty() && url.is_none() {
+        if query.is_empty() && url.is_none() && action_type.is_empty() {
             return None;
         }
 
-        let mut lines = vec!["**Web search**".to_string()];
-        if !query.is_empty() {
-            lines.push(format!("query: `{query}`"));
-        }
-        if let Some(url) = url {
-            lines.push(format!("opened: {url}"));
-        }
-        lines.push(format!("action: `{action_type}`"));
-        Some(lines.join("\n"))
+        let details = WebSearchDetails {
+            query,
+            action_type: action_type.to_string(),
+            url,
+            queries,
+        };
+        Some(RenderableMessage::WebSearch {
+            details,
+            expanded: false,
+        })
     }
 
     fn image_ref_for_message(path_or_url: &str) -> String {
@@ -2585,13 +2735,7 @@ impl AppShell {
         match item.get("type").and_then(Value::as_str) {
             Some("commandExecution") => Self::format_command_execution_item(item),
             Some("fileChange") => Self::format_file_change_item(item),
-            Some("webSearch") => {
-                Self::format_web_search_item(item).map(|content| RenderableMessage::Text {
-                    speaker: ThreadSpeaker::Assistant,
-                    content,
-                    image_refs: Vec::new(),
-                })
-            }
+            Some("webSearch") => Self::format_web_search_item(item),
             _ => None,
         }
     }
@@ -2721,7 +2865,14 @@ impl AppShell {
                 match response {
                     Ok(payload) => match Self::renderable_messages_from_thread_response(&payload) {
                         Ok(raw) => {
-                            view.selected_thread_messages = Self::build_messages_from_raw(raw, cx);
+                            let existing_raw = Self::renderable_messages_from_thread_messages(
+                                &view.selected_thread_messages,
+                            );
+                            let merged_raw =
+                                Self::merge_resume_renderable_messages(existing_raw, raw);
+                            view.selected_thread_messages =
+                                Self::build_messages_from_raw(merged_raw, cx);
+                            view.reset_live_tool_message_state();
                             let image_refs = view
                                 .selected_thread_messages
                                 .iter()
@@ -4397,6 +4548,125 @@ impl AppShell {
                     .into_any_element()
             })
             .collect()
+    }
+
+    fn render_web_search_card(
+        details: &WebSearchDetails,
+        text_color: gpui::Hsla,
+        subtext_color: gpui::Hsla,
+        surface0: gpui::Hsla,
+        surface1: gpui::Hsla,
+        mantle: gpui::Hsla,
+        font_mono: &gpui::SharedString,
+    ) -> gpui::AnyElement {
+        let mut rows = Vec::new();
+        if !details.query.is_empty() {
+            rows.push(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().text_xs().text_color(subtext_color).child("Query"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family(font_mono.clone())
+                            .text_color(text_color)
+                            .child(details.query.clone()),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        if !details.queries.is_empty() {
+            rows.push(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().text_xs().text_color(subtext_color).child("Queries"))
+                    .child(div().flex().flex_col().gap(px(2.)).children(
+                        details.queries.iter().enumerate().map(|(ix, query)| {
+                            div()
+                                .text_sm()
+                                .font_family(font_mono.clone())
+                                .text_color(text_color)
+                                .child(format!("{}. {query}", ix + 1))
+                                .into_any_element()
+                        }),
+                    ))
+                    .into_any_element(),
+            );
+        }
+
+        if let Some(url) = details.url.as_deref() {
+            rows.push(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().text_xs().text_color(subtext_color).child("Opened"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family(font_mono.clone())
+                            .text_color(text_color)
+                            .child(url.to_string()),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        rows.push(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().text_xs().text_color(subtext_color).child("Action"))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_family(font_mono.clone())
+                        .text_color(text_color)
+                        .child(details.action_type.clone()),
+                )
+                .into_any_element(),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(surface1)
+            .overflow_hidden()
+            .child(
+                div()
+                    .w_full()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .bg(mantle)
+                    .text_xs()
+                    .font_family(font_mono.clone())
+                    .text_color(text_color)
+                    .child("Web search"),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .bg(surface0)
+                    .px(px(12.))
+                    .py(px(10.))
+                    .children(rows),
+            )
+            .into_any_element()
     }
 
     fn render_branch_diff_panel(
@@ -6518,6 +6788,74 @@ impl Render for AppShell {
                                                                     )
                                                                     .into_any_element()
                                                             }
+                                                            ThreadMessageKind::WebSearch {
+                                                                details,
+                                                                expanded,
+                                                            } => {
+                                                                let web_search_accordion_id =
+                                                                    format!("web-search-{message_ix}");
+                                                                let details = details.clone();
+                                                                let expanded = *expanded;
+                                                                let action_label =
+                                                                    Self::web_search_action_label(
+                                                                        &details.action_type,
+                                                                    );
+
+                                                                div()
+                                                                    .w_full()
+                                                                    .mb(px(10.))
+                                                                    .flex()
+                                                                    .justify_start()
+                                                                    .child(
+                                                                        div()
+                                                                            .w_full()
+                                                                            .max_w(px(930.))
+                                                                            .child(
+                                                                                gpui_component::accordion::Accordion::new(
+                                                                                    web_search_accordion_id,
+                                                                                )
+                                                                                .item(|this| {
+                                                                                    this
+                                                                                        .open(expanded)
+                                                                                        .title(
+                                                                                            format!(
+                                                                                                "Web search · {action_label}"
+                                                                                            ),
+                                                                                        )
+                                                                                        .child(
+                                                                                            Self::render_web_search_card(
+                                                                                                &details,
+                                                                                                text_color,
+                                                                                                subtext_color,
+                                                                                                surface0,
+                                                                                                surface1,
+                                                                                                mantle,
+                                                                                                &font_mono,
+                                                                                            ),
+                                                                                        )
+                                                                                })
+                                                                                .on_toggle_click(
+                                                                                    cx.listener(
+                                                                                        move |view, open_ixs: &[usize], _, cx| {
+                                                                                            if let Some(message) = view
+                                                                                                .selected_thread_messages
+                                                                                                .get_mut(message_ix)
+                                                                                                && let ThreadMessageKind::WebSearch {
+                                                                                                    expanded,
+                                                                                                    ..
+                                                                                                } = &mut message.kind
+                                                                                            {
+                                                                                                *expanded = open_ixs
+                                                                                                    .contains(&0);
+                                                                                                cx.notify();
+                                                                                            }
+                                                                                        },
+                                                                                    ),
+                                                                                ),
+                                                                            ),
+                                                                    )
+                                                                    .into_any_element()
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -7685,10 +8023,18 @@ mod tests {
         });
 
         let rendered = AppShell::format_web_search_item(&item).expect("should render");
-        assert!(rendered.contains("**Web search**"));
-        assert!(rendered.contains("query: `Hacker News top stories API`"));
-        assert!(rendered.contains("opened: https://news.ycombinator.com/"));
-        assert!(rendered.contains("action: `openPage`"));
+        match rendered {
+            RenderableMessage::WebSearch { details, expanded } => {
+                assert!(!expanded);
+                assert_eq!(details.query, "Hacker News top stories API");
+                assert_eq!(details.action_type, "openPage");
+                assert_eq!(
+                    details.url.as_deref(),
+                    Some("https://news.ycombinator.com/")
+                );
+            }
+            other => panic!("expected web search renderable message, got {other:?}"),
+        }
     }
 
     #[test]
@@ -7803,14 +8149,7 @@ mod tests {
             &messages[1],
             RenderableMessage::CommandExecution { expanded, .. } if !expanded
         ));
-        assert!(matches!(
-            &messages[2],
-            RenderableMessage::Text {
-                speaker: ThreadSpeaker::Assistant,
-                content,
-                ..
-            } if content.contains("**Web search**")
-        ));
+        assert!(matches!(&messages[2], RenderableMessage::WebSearch { .. }));
         assert!(matches!(&messages[3], RenderableMessage::FileChange { .. }));
         assert!(matches!(
             &messages[4],
@@ -7854,6 +8193,98 @@ mod tests {
                 image_refs,
             } if content == "testing" && image_refs == &vec!["data:image/png;base64,AAA".to_string()]
         ));
+    }
+
+    #[test]
+    fn merge_resume_renderable_messages_preserves_existing_tool_messages_when_fetched_has_none() {
+        let existing = vec![
+            RenderableMessage::Text {
+                speaker: ThreadSpeaker::User,
+                content: "run checks".to_string(),
+                image_refs: Vec::new(),
+            },
+            RenderableMessage::CommandExecution {
+                header: "Ran command".to_string(),
+                status_label: "Success".to_string(),
+                content: "cargo check".to_string(),
+                expanded: false,
+            },
+            RenderableMessage::Text {
+                speaker: ThreadSpeaker::Assistant,
+                content: "running".to_string(),
+                image_refs: Vec::new(),
+            },
+            RenderableMessage::FileChange {
+                status_label: "Completed".to_string(),
+                file_diffs: Vec::new(),
+                expanded: true,
+            },
+            RenderableMessage::Text {
+                speaker: ThreadSpeaker::Assistant,
+                content: "done".to_string(),
+                image_refs: Vec::new(),
+            },
+        ];
+
+        let fetched = vec![
+            RenderableMessage::Text {
+                speaker: ThreadSpeaker::User,
+                content: "run checks".to_string(),
+                image_refs: Vec::new(),
+            },
+            RenderableMessage::Text {
+                speaker: ThreadSpeaker::Assistant,
+                content: "running".to_string(),
+                image_refs: Vec::new(),
+            },
+            RenderableMessage::Text {
+                speaker: ThreadSpeaker::Assistant,
+                content: "done".to_string(),
+                image_refs: Vec::new(),
+            },
+        ];
+
+        let merged = AppShell::merge_resume_renderable_messages(existing, fetched);
+        assert_eq!(merged.len(), 5);
+        assert!(matches!(
+            &merged[1],
+            RenderableMessage::CommandExecution { .. }
+        ));
+        assert!(matches!(&merged[3], RenderableMessage::FileChange { .. }));
+    }
+
+    #[test]
+    fn merge_resume_renderable_messages_uses_fetched_when_fetched_has_tool_messages() {
+        let existing = vec![
+            RenderableMessage::Text {
+                speaker: ThreadSpeaker::User,
+                content: "run checks".to_string(),
+                image_refs: Vec::new(),
+            },
+            RenderableMessage::CommandExecution {
+                header: "Ran command".to_string(),
+                status_label: "Success".to_string(),
+                content: "old".to_string(),
+                expanded: false,
+            },
+        ];
+
+        let fetched = vec![
+            RenderableMessage::Text {
+                speaker: ThreadSpeaker::User,
+                content: "run checks".to_string(),
+                image_refs: Vec::new(),
+            },
+            RenderableMessage::CommandExecution {
+                header: "Ran command".to_string(),
+                status_label: "Success".to_string(),
+                content: "new".to_string(),
+                expanded: false,
+            },
+        ];
+
+        let merged = AppShell::merge_resume_renderable_messages(existing, fetched.clone());
+        assert_eq!(merged, fetched);
     }
 
     #[test]
