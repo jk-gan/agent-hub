@@ -521,6 +521,7 @@ struct AppShell {
     approval_selected_ix: usize,
     thread_token_usage: Option<ThreadTokenUsage>,
     attached_images: Vec<PathBuf>,
+    image_dimensions_by_ref: HashMap<String, (f32, f32)>,
     branch_diff_focus_handle: FocusHandle,
     skill_picker_scroll_handle: ScrollHandle,
     file_picker_scroll_handle: ScrollHandle,
@@ -637,6 +638,7 @@ impl AppShell {
             approval_selected_ix: 0,
             thread_token_usage: None,
             attached_images: Vec::new(),
+            image_dimensions_by_ref: HashMap::new(),
             branch_diff_focus_handle: cx.focus_handle(),
             skill_picker_scroll_handle: ScrollHandle::new(),
             file_picker_scroll_handle: ScrollHandle::new(),
@@ -2052,14 +2054,19 @@ impl AppShell {
         if let Some(ix) = self.live_tool_message_ix_by_item_id.get(item_id).copied()
             && let Some(existing) = self.selected_thread_messages.get_mut(ix)
         {
-            if !existing.content.is_empty()
+            let should_insert_newline = !existing.content.is_empty()
                 && !existing.content.ends_with('\n')
-                && !delta.starts_with('\n')
-            {
+                && !delta.starts_with('\n');
+            if should_insert_newline {
                 existing.content.push('\n');
             }
             existing.content.push_str(delta);
-            existing.view_state = Self::new_message_state(&existing.content, cx);
+            existing.view_state.update(cx, |state, cx| {
+                if should_insert_newline {
+                    state.push_str("\n", cx);
+                }
+                state.push_str(delta, cx);
+            });
             self.scroll_handle.scroll_to_bottom();
             return;
         }
@@ -2612,6 +2619,14 @@ impl AppShell {
                     Ok(payload) => match Self::renderable_messages_from_thread_response(&payload) {
                         Ok(raw) => {
                             view.selected_thread_messages = Self::build_messages_from_raw(raw, cx);
+                            let image_refs = view
+                                .selected_thread_messages
+                                .iter()
+                                .flat_map(|message| message.image_refs.iter().cloned())
+                                .collect::<Vec<_>>();
+                            for image_ref in image_refs {
+                                view.cache_local_image_dimensions_for_ref(&image_ref);
+                            }
                             view.selected_thread_error = None;
                             view.selected_thread_loaded_from_api_id =
                                 Some(selected_thread_id.clone());
@@ -3332,6 +3347,7 @@ impl AppShell {
         self.file_picker_selected_ix = 0;
         self.pending_approvals.clear();
         self.approval_selected_ix = 0;
+        self.image_dimensions_by_ref.clear();
     }
 
     fn apply_account_read_payload(&mut self, payload: &Value) {
@@ -3701,8 +3717,9 @@ impl AppShell {
             while let Ok(notification) = event_rx.recv().await {
                 let should_continue = view
                     .update(cx, |view, cx| {
-                        view.handle_notification(&notification, cx);
-                        cx.notify();
+                        if view.handle_notification(&notification, cx) {
+                            cx.notify();
+                        }
                         true
                     })
                     .unwrap_or(false);
@@ -3714,20 +3731,24 @@ impl AppShell {
         .detach();
     }
 
-    fn handle_notification(&mut self, notification: &ServerNotification, cx: &mut Context<Self>) {
+    fn handle_notification(
+        &mut self,
+        notification: &ServerNotification,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if notification.request_id.is_some() {
             if matches!(
                 notification.method.as_str(),
                 "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
             ) {
-                self.queue_approval_request(notification);
+                return self.queue_approval_request(notification);
             } else {
                 self.set_thread_error(
                     format!("Unsupported server request: {}", notification.method),
                     cx,
                 );
+                return true;
             }
-            return;
         }
 
         let notification_thread_id = notification.params.get("threadId").and_then(Value::as_str);
@@ -3740,11 +3761,12 @@ impl AppShell {
             Some(thread_id) => self.selected_thread_id.as_deref() == Some(thread_id),
             None => true,
         };
+        let mut changed = false;
 
         match notification.method.as_str() {
             "item/agentMessage/delta" => {
                 if !applies_to_selected_thread {
-                    return;
+                    return false;
                 }
                 if let Some(delta) = notification.params.get("delta").and_then(Value::as_str) {
                     let ix = match self.streaming_message_ix {
@@ -3769,52 +3791,61 @@ impl AppShell {
                         state.push_str(delta, cx);
                     });
                     self.scroll_handle.scroll_to_bottom();
+                    changed = true;
                 }
             }
             "item/started" => {
                 if !applies_to_selected_thread {
-                    return;
+                    return false;
                 }
                 self.streaming_message_ix = None;
+                changed = true;
                 if let Some(item) = notification.params.get("item")
                     && let Some(item_id) = item.get("id").and_then(Value::as_str)
                     && let Some(tool_message) = Self::renderable_message_from_tool_item(item)
                 {
                     self.upsert_live_tool_message(item_id, tool_message, cx);
+                    changed = true;
                 }
             }
             "item/commandExecution/outputDelta" => {
                 if !applies_to_selected_thread {
-                    return;
+                    return false;
                 }
                 self.streaming_message_ix = None;
+                changed = true;
                 if let Some(item_id) = notification.params.get("itemId").and_then(Value::as_str)
                     && let Some(delta) = notification.params.get("delta").and_then(Value::as_str)
                 {
                     self.append_live_tool_output_delta(item_id, delta, "Ran command", cx);
+                    changed = true;
                 }
             }
             "item/fileChange/outputDelta" => {
                 if !applies_to_selected_thread {
-                    return;
+                    return false;
                 }
                 self.streaming_message_ix = None;
+                changed = true;
                 if let Some(item_id) = notification.params.get("itemId").and_then(Value::as_str)
                     && let Some(delta) = notification.params.get("delta").and_then(Value::as_str)
                 {
                     self.append_live_tool_output_delta(item_id, delta, "File changes", cx);
+                    changed = true;
                 }
             }
             "item/completed" => {
                 if !applies_to_selected_thread {
-                    return;
+                    return false;
                 }
                 self.streaming_message_ix = None;
+                changed = true;
                 if let Some(item) = notification.params.get("item")
                     && let Some(tool_message) = Self::renderable_message_from_tool_item(item)
                     && let Some(item_id) = item.get("id").and_then(Value::as_str)
                 {
                     self.upsert_live_tool_message(item_id, tool_message, cx);
+                    changed = true;
                 }
                 if let Some(item_type) = notification
                     .params
@@ -3824,6 +3855,7 @@ impl AppShell {
                     && matches!(item_type, "commandExecution" | "fileChange")
                 {
                     self.branch_diff_needs_refresh = true;
+                    changed = true;
                 }
             }
             "turn/started" => {
@@ -3833,9 +3865,11 @@ impl AppShell {
                         self.active_turn_id_by_thread
                             .insert(thread_id.to_string(), turn_id.to_string());
                     }
+                    changed = true;
                 }
                 if applies_to_selected_thread {
                     self.selected_thread_error = None;
+                    changed = true;
                 }
             }
             "turn/completed" => {
@@ -3848,16 +3882,19 @@ impl AppShell {
                 } else {
                     self.pending_new_thread = false;
                 }
+                changed = true;
 
                 if applies_to_selected_thread {
                     self.streaming_message_ix = None;
                     self.branch_diff_needs_refresh = true;
+                    changed = true;
 
                     if let Some(turn) = notification.params.get("turn")
                         && let Some(error) = turn.get("error")
                         && let Some(message) = error.get("message").and_then(Value::as_str)
                     {
                         self.set_thread_error(message.to_string(), cx);
+                        changed = true;
                     }
                 }
             }
@@ -3867,6 +3904,7 @@ impl AppShell {
                         && let Some(message) = error.get("message").and_then(Value::as_str)
                     {
                         self.set_thread_error(message.to_string(), cx);
+                        changed = true;
                     }
                 }
             }
@@ -3885,11 +3923,12 @@ impl AppShell {
                     (self.pending_login_id.as_deref(), login_id.as_deref())
                     && expected_login_id != received_login_id
                 {
-                    return;
+                    return false;
                 }
 
                 self.pending_login_id = None;
                 self.login_in_progress = false;
+                changed = true;
 
                 if success {
                     self.auth_error = None;
@@ -3903,6 +3942,7 @@ impl AppShell {
                         .and_then(Value::as_str)
                         .unwrap_or("Login failed");
                     self.auth_error = Some(reason.to_string());
+                    changed = true;
                 }
             }
             "account/updated" => {
@@ -3921,17 +3961,21 @@ impl AppShell {
                 } else if let Some(server) = self._app_server.clone() {
                     self.refresh_account_state(server, true, cx);
                 }
+                changed = true;
             }
             "account/rateLimits/updated" => {
                 self.rate_limits = Some(Self::parse_rate_limits(&notification.params));
+                changed = true;
             }
             "thread/tokenUsage/updated" => {
                 if applies_to_selected_thread {
                     self.thread_token_usage = Self::parse_thread_token_usage(&notification.params);
+                    changed = true;
                 }
             }
             _ => {}
         }
+        changed
     }
 
     fn format_window_label(window_mins: u64) -> String {
@@ -4172,11 +4216,10 @@ impl AppShell {
         font_mono: &gpui::SharedString,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let snapshot = self.branch_diff_snapshot.clone();
+        let snapshot = self.branch_diff_snapshot.as_ref();
         let branch_diff_error = self.branch_diff_error.clone();
         let branch_diff_loading = self.branch_diff_loading;
-        let selected_path = self.branch_diff_selected_path.clone();
-        let font_mono = font_mono.clone();
+        let selected_path = self.branch_diff_selected_path.as_deref();
 
         div()
             .relative()
@@ -4233,7 +4276,7 @@ impl AppShell {
                                     .child("Workspace changes"),
                             )
                             .child({
-                                if let Some(snapshot) = &snapshot {
+                                if let Some(snapshot) = snapshot {
                                     div()
                                         .text_xs()
                                         .text_color(subtext_color)
@@ -4367,14 +4410,13 @@ impl AppShell {
                                 snapshot
                                     .file_diffs
                                     .first()
-                                    .map(|file_diff| file_diff.path.clone())
+                                    .map(|file_diff| file_diff.path.as_str())
                             });
-                        let selected_file = selected_path.as_ref().and_then(|path| {
+                        let selected_file = selected_path.and_then(|path| {
                             snapshot
                                 .file_diffs
                                 .iter()
-                                .find(|file_diff| &file_diff.path == path)
-                                .cloned()
+                                .find(|file_diff| file_diff.path == path)
                         });
 
                         div()
@@ -4457,8 +4499,7 @@ impl AppShell {
                                                         let additions = file_diff.additions;
                                                         let deletions = file_diff.deletions;
                                                         let is_selected = selected_path
-                                                            .as_ref()
-                                                            .is_some_and(|selected| selected == &path);
+                                                            .is_some_and(|selected| selected == path.as_str());
                                                         div()
                                                             .id(("branch-diff-file", ix))
                                                             .w_full()
@@ -4521,14 +4562,13 @@ impl AppShell {
                                                     .px(px(10.))
                                                     .py(px(10.))
                                                     .child(if let Some(file_diff) = selected_file {
-                                                        let selected = vec![file_diff];
                                                         div()
                                                             .w_full()
                                                             .flex()
                                                             .flex_col()
                                                             .gap(px(12.))
                                                             .children(Self::render_file_diff_cards(
-                                                                &selected,
+                                                                std::slice::from_ref(file_diff),
                                                                 text_color,
                                                                 subtext_color,
                                                                 surface0,
@@ -4536,7 +4576,7 @@ impl AppShell {
                                                                 mantle,
                                                                 green_color,
                                                                 red_color,
-                                                                &font_mono,
+                                                                font_mono,
                                                             ))
                                                             .into_any_element()
                                                     } else {
@@ -4708,7 +4748,21 @@ impl AppShell {
             .is_some_and(|ext| Self::IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
     }
 
+    fn cache_local_image_dimensions_for_ref(&mut self, image_ref: &str) {
+        if self.image_dimensions_by_ref.contains_key(image_ref) {
+            return;
+        }
+
+        if let Some(dimensions) = Self::local_image_dimensions(image_ref) {
+            self.image_dimensions_by_ref
+                .insert(image_ref.to_string(), dimensions);
+        }
+    }
+
     fn add_image_attachment(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(image_ref) = path.to_str() {
+            self.cache_local_image_dimensions_for_ref(image_ref);
+        }
         if !self.attached_images.contains(&path) {
             self.attached_images.push(path);
             cx.notify();
@@ -4797,13 +4851,21 @@ impl AppShell {
     }
 
     fn message_image_preview_size(image_ref: &str, image_count: usize) -> (f32, f32) {
+        let dimensions = Self::local_image_dimensions(image_ref);
+        Self::message_image_preview_size_from_dimensions(dimensions, image_count)
+    }
+
+    fn message_image_preview_size_from_dimensions(
+        dimensions: Option<(f32, f32)>,
+        image_count: usize,
+    ) -> (f32, f32) {
         let (default_width, default_height) = if image_count <= 1 {
             (360., 220.)
         } else {
             (220., 160.)
         };
 
-        let Some((width, height)) = Self::local_image_dimensions(image_ref) else {
+        let Some((width, height)) = dimensions else {
             return (default_width, default_height);
         };
 
@@ -4921,6 +4983,12 @@ impl AppShell {
                     image_refs,
                     cx,
                 ));
+            if let Some(message) = self.selected_thread_messages.last() {
+                let refs = message.image_refs.clone();
+                for image_ref in refs {
+                    self.cache_local_image_dimensions_for_ref(&image_ref);
+                }
+            }
             self.streaming_message_ix = None;
             cx.notify();
 
@@ -4970,6 +5038,12 @@ impl AppShell {
                 image_refs,
                 cx,
             ));
+        if let Some(message) = self.selected_thread_messages.last() {
+            let refs = message.image_refs.clone();
+            for image_ref in refs {
+                self.cache_local_image_dimensions_for_ref(&image_ref);
+            }
+        }
         self.streaming_message_ix = None;
         cx.notify();
 
@@ -5902,6 +5976,26 @@ impl Render for AppShell {
                                                 match message.speaker {
                                                     ThreadSpeaker::User => {
                                                         let image_refs = message.image_refs.clone();
+                                                        let image_count = image_refs.len();
+                                                        let image_previews = image_refs
+                                                            .iter()
+                                                            .map(|image_ref| {
+                                                                let dimensions = self
+                                                                    .image_dimensions_by_ref
+                                                                    .get(image_ref)
+                                                                    .copied()
+                                                                    .or_else(|| {
+                                                                        AppShell::local_image_dimensions(
+                                                                            image_ref,
+                                                                        )
+                                                                    });
+                                                                let preview_size = AppShell::message_image_preview_size_from_dimensions(
+                                                                    dimensions,
+                                                                    image_count,
+                                                                );
+                                                                (image_ref.clone(), preview_size)
+                                                            })
+                                                            .collect::<Vec<_>>();
                                                         let has_text =
                                                             !message.content.trim().is_empty();
                                                         div()
@@ -5917,8 +6011,7 @@ impl Render for AppShell {
                                                                     .items_end()
                                                                     .gap(px(8.))
                                                                     .when(!image_refs.is_empty(), {
-                                                                        let image_count = image_refs.len();
-                                                                        let image_refs = image_refs;
+                                                                        let image_previews = image_previews;
                                                                         move |this| {
                                                                             this.child(
                                                                                 div()
@@ -5933,14 +6026,10 @@ impl Render for AppShell {
                                                                                     .justify_end()
                                                                                     .gap(px(6.))
                                                                                     .children(
-                                                                                        image_refs
+                                                                                        image_previews
                                                                                             .into_iter()
                                                                                             .map(
-                                                                                                |image_ref| {
-                                                                                                    let preview_size = AppShell::message_image_preview_size(
-                                                                                                        &image_ref,
-                                                                                                        image_count,
-                                                                                                    );
+                                                                                                |(image_ref, preview_size)| {
                                                                                                     let image = if Path::new(&image_ref)
                                                                                                         .is_absolute()
                                                                                                     {
@@ -6125,9 +6214,7 @@ impl Render for AppShell {
                                                                     );
                                                                 let status_label = status_label.clone();
                                                                 let expanded = *expanded;
-                                                                let file_diffs = file_diffs.clone();
                                                                 let total_files = file_diffs.len();
-                                                                let font_mono = font_mono.clone();
 
                                                                 div()
                                                                     .w_full()
@@ -6158,7 +6245,7 @@ impl Render for AppShell {
                                                                                                 .flex_col()
                                                                                                 .gap(px(12.))
                                                                                                 .children(Self::render_file_diff_cards(
-                                                                                                    &file_diffs,
+                                                                                                    file_diffs,
                                                                                                     text_color,
                                                                                                     subtext_color,
                                                                                                     surface0,
@@ -7590,12 +7677,12 @@ mod tests {
     fn composer_attachment_preview_size_uses_safe_default_for_non_local_images() {
         let (single_width, single_height) =
             AppShell::composer_attachment_preview_size("https://example.com/image.png", 1);
-        assert!((single_width - 150.).abs() < 0.01);
-        assert!((single_height - 96.).abs() < 0.01);
+        assert!((single_width - 40.).abs() < 0.01);
+        assert!((single_height - 40.).abs() < 0.01);
 
         let (multi_width, multi_height) =
             AppShell::composer_attachment_preview_size("data:image/png;base64,AAA", 3);
-        assert!((multi_width - 110.).abs() < 0.01);
-        assert!((multi_height - 72.).abs() < 0.01);
+        assert!((multi_width - 40.).abs() < 0.01);
+        assert!((multi_height - 40.).abs() < 0.01);
     }
 }
