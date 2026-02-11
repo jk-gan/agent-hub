@@ -26,3 +26,6 @@ description = "Agent Hub - An AI coding assistant platform"
 resources = ["assets"]
 icons = ["assets/app-icon.icns"]
 formats = ["app", "dmg"]
+
+[package.metadata.packager.macos]
+signing-identity = "Developer ID Application: Mohamed Maail (3N9F7839UV)"

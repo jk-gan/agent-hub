@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
@@ -14,7 +14,7 @@ env:
 jobs:
   build-macos:
     name: Build macOS (Apple Silicon)
-    runs-on: macos-latest
+    runs-on: macos-14
 
     steps:
       - name: Checkout repository
@@ -29,62 +29,62 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-packager
-        run: cargo install cargo-packager --locked
+        run: cargo install --locked cargo-packager
 
-      - name: Build release binary
-        run: cargo build --release --target aarch64-apple-darwin
+      - name: Prepare App Store Connect API key
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p private_keys
+          printf "%s" "$APPLE_API_PRIVATE_KEY" > "private_keys/AuthKey_${APPLE_API_KEY}.p8"
 
-      - name: Package application
+      - name: Package app (sign + notarize app bundle)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ github.workspace }}/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
         run: cargo packager --release --target aarch64-apple-darwin --verbose
 
-      - name: Ad-hoc sign the app bundle
+      - name: Notarize and staple DMG
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ github.workspace }}/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
         run: |
-          # Find the .app bundle
-          APP_BUNDLE=$(find target -name "*.app" -type d | head -1)
-          if [ -n "$APP_BUNDLE" ]; then
-            echo "Ad-hoc signing: $APP_BUNDLE"
-            codesign --remove-signature "$APP_BUNDLE" || true
-            codesign --force --deep --sign - "$APP_BUNDLE"
-            echo "Ad-hoc signing complete"
-          else
-            echo "Warning: No .app bundle found to sign"
+          set -euo pipefail
+          DMG_PATH="$(find target/release -maxdepth 1 -name '*.dmg' -type f | head -1)"
+          if [ -z "$DMG_PATH" ]; then
+            echo "No DMG found under target/release."
+            exit 1
           fi
+
+          xcrun notarytool submit "$DMG_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --key "$APPLE_API_KEY_PATH" \
+            --wait
+          xcrun stapler staple "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
 
       - name: Prepare artifacts
         run: |
           mkdir -p dist
-          # Find and copy .app bundle (compress to zip for upload)
-          if [ -d "target/aarch64-apple-darwin/release/bundle/macos" ]; then
-            APP_DIR="target/aarch64-apple-darwin/release/bundle/macos"
-          elif [ -d "target/release/bundle/macos" ]; then
-            APP_DIR="target/release/bundle/macos"
-          else
-            echo "Looking for .app in common locations..."
-            find target -name "*.app" -type d 2>/dev/null || true
-            find target -name "*.dmg" -type f 2>/dev/null || true
-            APP_DIR=$(find target -path "*/bundle/macos" -type d 2>/dev/null | head -1)
+          APP_PATH="$(find target/release -maxdepth 1 -name '*.app' -type d | head -1)"
+          DMG_PATH="$(find target/release -maxdepth 1 -name '*.dmg' -type f | head -1)"
+
+          if [ -z "$APP_PATH" ] || [ -z "$DMG_PATH" ]; then
+            echo "Expected app and dmg in target/release but did not find them."
+            find target -name '*.app' -type d || true
+            find target -name '*.dmg' -type f || true
+            exit 1
           fi
 
-          echo "APP_DIR: $APP_DIR"
-
-          # Copy .app bundle as a zip
-          if ls "$APP_DIR"/*.app 1>/dev/null 2>&1; then
-            cd "$APP_DIR"
-            for app in *.app; do
-              zip -r -y "$GITHUB_WORKSPACE/dist/Agent-Hub-arm64.app.zip" "$app"
-            done
-            cd "$GITHUB_WORKSPACE"
-          fi
-
-          # Copy .dmg if it exists
-          find target -name "*.dmg" -type f -exec cp {} dist/ \; 2>/dev/null || true
-
-          # Rename dmg to include architecture
-          for dmg in dist/*.dmg; do
-            [ -f "$dmg" ] || continue
-            base=$(basename "$dmg" .dmg)
-            mv "$dmg" "dist/${base}-arm64.dmg"
-          done
+          ditto -c -k --keepParent "$APP_PATH" "dist/Agent-Hub-arm64.app.zip"
+          cp "$DMG_PATH" "dist/Agent-Hub-arm64.dmg"
 
           echo "=== Artifacts ==="
           ls -la dist/
@@ -129,10 +129,6 @@ jobs:
             1. Download `Agent-Hub-arm64.dmg` or `Agent-Hub-arm64.app.zip`.
             2. If using `.dmg`: Open the disk image and drag **Agent Hub** to your Applications folder.
                If using `.app.zip`: Unzip and move **Agent Hub.app** to your Applications folder.
-            3. **Important**: Since this app is not yet code-signed, macOS may show an error saying the app "is damaged". To fix this, open Terminal and run:
-               ```
-               xattr -cr "/Applications/Agent Hub.app"
-               ```
-            4. Now you can open Agent Hub normally from your Applications folder.
+            3. The app is code-signed and notarized for a smoother first launch experience on macOS.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

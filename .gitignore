@@ -1,3 +1,4 @@
 /target
 /logs
 .agent-hub-*.json
+.local-secrets/
