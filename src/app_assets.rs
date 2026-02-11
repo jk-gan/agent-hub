@@ -33,10 +33,11 @@ impl Assets {
     pub fn load_fonts(&self, cx: &gpui::App) -> gpui::Result<()> {
         let mut embedded_fonts = Vec::new();
         for path in Self::iter() {
-            if path.starts_with("fonts") && path.ends_with(".ttf") {
-                if let Some(file) = Self::get(&path) {
-                    embedded_fonts.push(file.data);
-                }
+            if path.starts_with("fonts")
+                && path.ends_with(".ttf")
+                && let Some(file) = Self::get(&path)
+            {
+                embedded_fonts.push(file.data);
             }
         }
 
