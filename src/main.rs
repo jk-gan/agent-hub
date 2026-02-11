@@ -4030,6 +4030,28 @@ impl AppShell {
         (line_number_digits * 9. + 16.).max(44.)
     }
 
+    fn file_diff_content_min_width(
+        file_diff: &diff_view::ParsedFileDiff,
+        line_number_column_width: f32,
+    ) -> f32 {
+        let max_text_chars = file_diff
+            .rows
+            .iter()
+            .map(|row| match row {
+                diff_view::DiffRow::HunkHeader(header) => header.raw.chars().count(),
+                diff_view::DiffRow::Line(line) => line.text.chars().count(),
+            })
+            .max()
+            .unwrap_or(0) as f32;
+
+        // Approximate monospace text width to guarantee a scrollable content width
+        // when any line is longer than the viewport.
+        let monospace_char_px = 8.2;
+        let gutters_px = line_number_column_width * 2. + 35.;
+        let estimated_width = gutters_px + max_text_chars * monospace_char_px;
+        estimated_width.max(line_number_column_width * 2. + 120.)
+    }
+
     fn render_file_diff_cards(
         file_diffs: &[diff_view::ParsedFileDiff],
         text_color: gpui::Hsla,
@@ -4040,6 +4062,8 @@ impl AppShell {
         green_color: gpui::Hsla,
         red_color: gpui::Hsla,
         font_mono: &gpui::SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let added_bg = gpui::Hsla {
             a: 0.12,
@@ -4057,7 +4081,15 @@ impl AppShell {
                 let total_del = file_diff.deletions;
                 let path = file_diff.path.clone();
                 let horizontal_scroll_id = format!("file-diff-lines-scroll-{}", file_diff.path);
+                let horizontal_scroll_state_id =
+                    format!("file-diff-lines-scroll-state-{}", file_diff.path);
+                let horizontal_scroll_handle = window
+                    .use_keyed_state(horizontal_scroll_state_id, cx, |_, _| ScrollHandle::new())
+                    .read(cx)
+                    .clone();
                 let line_number_column_width = Self::file_diff_line_number_column_width(file_diff);
+                let content_min_width =
+                    Self::file_diff_content_min_width(file_diff, line_number_column_width);
 
                 div()
                     .flex()
@@ -4098,104 +4130,112 @@ impl AppShell {
                     )
                     .child(
                         div()
-                            .id(horizontal_scroll_id)
+                            .relative()
                             .w_full()
-                            .overflow_x_scroll()
-                            .map(|mut this| {
-                                // Keep wheel scrolling vertical unless horizontal intent is explicit.
-                                this.style().restrict_scroll_to_axis = Some(true);
-                                this
-                            })
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_start()
-                                    .min_w_full()
-                                    .font_family(font_mono.clone())
-                                    .text_sm()
-                                    .children(file_diff.rows.iter().map(|row| {
-                                        match row {
-                                            diff_view::DiffRow::HunkHeader(h) => div()
-                                                .min_w_full()
-                                                .px(px(12.))
-                                                .py(px(4.))
-                                                .bg(surface0)
-                                                .text_color(subtext_color)
-                                                .text_xs()
-                                                .whitespace_nowrap()
-                                                .child(h.raw.clone())
-                                                .into_any_element(),
-                                            diff_view::DiffRow::Line(line) => {
-                                                let (row_bg, bar_color) = match line.kind {
-                                                    diff_view::DiffLineKind::Added => {
-                                                        (added_bg, green_color)
-                                                    }
-                                                    diff_view::DiffLineKind::Removed => {
-                                                        (removed_bg, red_color)
-                                                    }
-                                                    diff_view::DiffLineKind::Context => (
-                                                        gpui::Hsla::transparent_black(),
-                                                        gpui::Hsla::transparent_black(),
-                                                    ),
-                                                };
-                                                let old_ln = line.old_lineno.map_or_else(
-                                                    || "\u{00A0}".to_string(),
-                                                    |n| n.to_string(),
-                                                );
-                                                let new_ln = line.new_lineno.map_or_else(
-                                                    || "\u{00A0}".to_string(),
-                                                    |n| n.to_string(),
-                                                );
-                                                let display_text = if line.text.is_empty() {
-                                                    "\u{00A0}".to_string()
-                                                } else {
-                                                    line.text.replace(' ', "\u{00A0}")
-                                                };
+                                    .id(horizontal_scroll_id)
+                                    .w_full()
+                                    .overflow_x_scroll()
+                                    .track_scroll(&horizontal_scroll_handle)
+                                    .map(|mut this| {
+                                        // Keep vertical wheel events on the outer vertical scroller.
+                                        // Horizontal movement still works via horizontal wheel/gesture
+                                        // and dragging the explicit horizontal scrollbar.
+                                        this.style().restrict_scroll_to_axis = Some(true);
+                                        this
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .items_start()
+                                            .w(px(content_min_width))
+                                            .min_w_full()
+                                            .font_family(font_mono.clone())
+                                            .text_sm()
+                                            .children(file_diff.rows.iter().map(|row| match row {
+                                                diff_view::DiffRow::HunkHeader(h) => div()
+                                                    .w_full()
+                                                    .px(px(12.))
+                                                    .py(px(4.))
+                                                    .bg(surface0)
+                                                    .text_color(subtext_color)
+                                                    .text_xs()
+                                                    .whitespace_nowrap()
+                                                    .child(h.raw.clone())
+                                                    .into_any_element(),
+                                                diff_view::DiffRow::Line(line) => {
+                                                    let (row_bg, bar_color) = match line.kind {
+                                                        diff_view::DiffLineKind::Added => {
+                                                            (added_bg, green_color)
+                                                        }
+                                                        diff_view::DiffLineKind::Removed => {
+                                                            (removed_bg, red_color)
+                                                        }
+                                                        diff_view::DiffLineKind::Context => (
+                                                            gpui::Hsla::transparent_black(),
+                                                            gpui::Hsla::transparent_black(),
+                                                        ),
+                                                    };
+                                                    let old_ln = line.old_lineno.map_or_else(
+                                                        || "\u{00A0}".to_string(),
+                                                        |n| n.to_string(),
+                                                    );
+                                                    let new_ln = line.new_lineno.map_or_else(
+                                                        || "\u{00A0}".to_string(),
+                                                        |n| n.to_string(),
+                                                    );
+                                                    let display_text = if line.text.is_empty() {
+                                                        "\u{00A0}".to_string()
+                                                    } else {
+                                                        line.text.replace(' ', "\u{00A0}")
+                                                    };
 
-                                                div()
-                                                    .min_w_full()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .bg(row_bg)
-                                                    .border_l_3()
-                                                    .border_color(bar_color)
-                                                    .child(
-                                                        div()
-                                                            .w(px(line_number_column_width))
-                                                            .flex_shrink_0()
-                                                            .px(px(6.))
-                                                            .py(px(1.))
-                                                            .text_color(subtext_color)
-                                                            .text_right()
-                                                            .whitespace_nowrap()
-                                                            .child(old_ln),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w(px(line_number_column_width))
-                                                            .flex_shrink_0()
-                                                            .px(px(6.))
-                                                            .py(px(1.))
-                                                            .text_color(subtext_color)
-                                                            .text_right()
-                                                            .whitespace_nowrap()
-                                                            .child(new_ln),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .flex_shrink_0()
-                                                            .px(px(8.))
-                                                            .py(px(1.))
-                                                            .text_color(text_color)
-                                                            .whitespace_nowrap()
-                                                            .child(display_text),
-                                                    )
-                                                    .into_any_element()
-                                            }
-                                        }
-                                    })),
-                            ),
+                                                    div()
+                                                        .w_full()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .bg(row_bg)
+                                                        .border_l_3()
+                                                        .border_color(bar_color)
+                                                        .child(
+                                                            div()
+                                                                .w(px(line_number_column_width))
+                                                                .flex_shrink_0()
+                                                                .px(px(6.))
+                                                                .py(px(1.))
+                                                                .text_color(subtext_color)
+                                                                .text_right()
+                                                                .whitespace_nowrap()
+                                                                .child(old_ln),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w(px(line_number_column_width))
+                                                                .flex_shrink_0()
+                                                                .px(px(6.))
+                                                                .py(px(1.))
+                                                                .text_color(subtext_color)
+                                                                .text_right()
+                                                                .whitespace_nowrap()
+                                                                .child(new_ln),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .flex_shrink_0()
+                                                                .px(px(8.))
+                                                                .py(px(1.))
+                                                                .text_color(text_color)
+                                                                .whitespace_nowrap()
+                                                                .child(display_text),
+                                                        )
+                                                        .into_any_element()
+                                                }
+                                            })),
+                                    ),
+                            )
+                            .horizontal_scrollbar(&horizontal_scroll_handle),
                     )
                     .into_any_element()
             })
@@ -4214,6 +4254,7 @@ impl AppShell {
         red_color: gpui::Hsla,
         green_color: gpui::Hsla,
         font_mono: &gpui::SharedString,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let snapshot = self.branch_diff_snapshot.as_ref();
@@ -4577,6 +4618,8 @@ impl AppShell {
                                                                 green_color,
                                                                 red_color,
                                                                 font_mono,
+                                                                window,
+                                                                cx,
                                                             ))
                                                             .into_any_element()
                                                     } else {
@@ -5181,7 +5224,7 @@ impl AppShell {
 }
 
 impl Render for AppShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_load_threads(cx);
         self.ensure_composer_options_for_active_workspace(cx);
         self.maybe_refresh_branch_diff(cx);
@@ -6254,6 +6297,8 @@ impl Render for AppShell {
                                                                                                     green_color,
                                                                                                     red_color,
                                                                                                     &font_mono,
+                                                                                                    window,
+                                                                                                    cx,
                                                                                                 )),
                                                                                         )
                                                                                 })
@@ -7312,6 +7357,7 @@ impl Render for AppShell {
                     red_color,
                     green_color,
                     &font_mono,
+                    window,
                     cx,
                 ))
         } else {
