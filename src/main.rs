@@ -446,6 +446,7 @@ struct BranchDiffSnapshot {
     cwd: String,
     branch_name: String,
     base_ref: String,
+    is_git_repository: bool,
     file_diffs: Vec<diff_view::ParsedFileDiff>,
     total_additions: usize,
     total_deletions: usize,
@@ -1066,6 +1067,22 @@ impl AppShell {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    fn git_is_inside_work_tree(cwd: &Path) -> Result<bool, String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(cwd)
+            .output()
+            .map_err(|error| {
+                format!("failed to run git rev-parse --is-inside-work-tree: {error}")
+            })?;
+
+        if !output.status.success() {
+            return Ok(false);
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+    }
+
     fn git_ref_exists(cwd: &Path, reference: &str) -> bool {
         Command::new("git")
             .args(["rev-parse", "--verify", "--quiet", reference])
@@ -1153,11 +1170,17 @@ impl AppShell {
             return Err(format!("Workspace path is not a directory: {cwd}"));
         }
 
-        let is_work_tree = Self::git_output(&root, &["rev-parse", "--is-inside-work-tree"])?
-            .trim()
-            .eq("true");
+        let is_work_tree = Self::git_is_inside_work_tree(&root)?;
         if !is_work_tree {
-            return Err(format!("Workspace is not a git repository: {cwd}"));
+            return Ok(BranchDiffSnapshot {
+                cwd: cwd.to_string(),
+                branch_name: "No Git repository".to_string(),
+                base_ref: "workspace".to_string(),
+                is_git_repository: false,
+                file_diffs: Vec::new(),
+                total_additions: 0,
+                total_deletions: 0,
+            });
         }
 
         let branch_name = Self::git_output(&root, &["rev-parse", "--abbrev-ref", "HEAD"])?
@@ -1219,6 +1242,7 @@ impl AppShell {
             cwd: cwd.to_string(),
             branch_name,
             base_ref: "working tree".to_string(),
+            is_git_repository: true,
             file_diffs,
             total_additions,
             total_deletions,
@@ -1853,10 +1877,91 @@ impl AppShell {
             })
             .collect::<Vec<_>>();
 
-        rows.sort_by_key(|row| Reverse(row.updated_at.unwrap_or(0)));
-        rows.truncate(50);
+        Self::sort_and_limit_thread_rows(&mut rows);
 
         Ok(rows)
+    }
+
+    fn sort_and_limit_thread_rows(rows: &mut Vec<ThreadRow>) {
+        rows.sort_by_key(|row| Reverse(row.updated_at.unwrap_or(0)));
+        rows.truncate(50);
+    }
+
+    fn parse_thread_row_from_value(thread: &Value) -> Option<ThreadRow> {
+        let id = thread.get("id").and_then(Value::as_str)?.trim().to_string();
+        if id.is_empty() {
+            return None;
+        }
+
+        let preview = thread.get("preview").and_then(Value::as_str);
+        let updated_at = thread
+            .get("updatedAt")
+            .and_then(Value::as_u64)
+            .or_else(|| thread.get("createdAt").and_then(Value::as_u64));
+        let cwd = thread
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        Some(ThreadRow {
+            title: Self::make_title(preview, &id),
+            id,
+            updated_at,
+            cwd,
+        })
+    }
+
+    fn is_generated_thread_title(title: &str) -> bool {
+        title.starts_with("thread-")
+    }
+
+    fn upsert_thread_row(&mut self, mut row: ThreadRow) {
+        if !row.cwd.trim().is_empty() {
+            self.known_workspace_cwds.insert(row.cwd.clone());
+        }
+
+        if let Some(existing) = self
+            .threads
+            .iter_mut()
+            .find(|existing| existing.id == row.id)
+        {
+            if row.cwd.trim().is_empty() {
+                row.cwd = existing.cwd.clone();
+            }
+            if row.updated_at.is_none() {
+                row.updated_at = existing.updated_at;
+            }
+            if Self::is_generated_thread_title(&row.title)
+                && !Self::is_generated_thread_title(&existing.title)
+            {
+                row.title = existing.title.clone();
+            }
+            *existing = row;
+        } else {
+            self.threads.push(row);
+        }
+
+        Self::sort_and_limit_thread_rows(&mut self.threads);
+    }
+
+    fn merge_inflight_rows(
+        mut server_rows: Vec<ThreadRow>,
+        existing_rows: &[ThreadRow],
+        inflight_threads: &HashSet<String>,
+    ) -> Vec<ThreadRow> {
+        for existing_row in existing_rows {
+            if inflight_threads.contains(existing_row.id.as_str())
+                && !server_rows
+                    .iter()
+                    .any(|server_row| server_row.id == existing_row.id)
+            {
+                server_rows.push(existing_row.clone());
+            }
+        }
+
+        Self::sort_and_limit_thread_rows(&mut server_rows);
+        server_rows
     }
 
     fn preferred_thread(threads: &[ThreadRow], selected_id: Option<&str>) -> Option<ThreadRow> {
@@ -1867,6 +1972,10 @@ impl AppShell {
         }
 
         threads.first().cloned()
+    }
+
+    fn selected_thread_changed(previous_thread_id: Option<&str>, next_thread_id: &str) -> bool {
+        previous_thread_id != Some(next_thread_id)
     }
 
     fn new_message_state(text: &str, cx: &mut Context<Self>) -> Entity<TextViewState> {
@@ -2584,13 +2693,7 @@ impl AppShell {
         let Some(selected_thread_id) = self.selected_thread_id.clone() else {
             return;
         };
-        if self.loading_selected_thread {
-            return;
-        }
-        if self.selected_thread_loaded_from_api_id.as_deref() == Some(selected_thread_id.as_str()) {
-            return;
-        }
-        if self.inflight_threads.contains(&selected_thread_id) {
+        if self.should_skip_selected_thread_fetch(selected_thread_id.as_str()) {
             return;
         }
 
@@ -2651,6 +2754,32 @@ impl AppShell {
         .detach();
     }
 
+    fn should_skip_selected_thread_fetch(&self, selected_thread_id: &str) -> bool {
+        Self::should_skip_selected_thread_fetch_for_state(
+            self.loading_selected_thread,
+            self.selected_thread_loaded_from_api_id.as_deref(),
+            selected_thread_id,
+            self.inflight_threads.contains(selected_thread_id),
+            !self.selected_thread_messages.is_empty(),
+        )
+    }
+
+    fn should_skip_selected_thread_fetch_for_state(
+        loading_selected_thread: bool,
+        loaded_thread_id: Option<&str>,
+        selected_thread_id: &str,
+        is_inflight: bool,
+        has_messages: bool,
+    ) -> bool {
+        if loading_selected_thread {
+            return true;
+        }
+        if loaded_thread_id == Some(selected_thread_id) {
+            return true;
+        }
+        is_inflight && has_messages
+    }
+
     fn refresh_selected_thread(&mut self, cx: &mut Context<Self>) {
         if self.composing_new_thread_cwd.is_some() && self.selected_thread_id.is_none() {
             self.selected_thread_title = Some("New thread".to_string());
@@ -2671,6 +2800,7 @@ impl AppShell {
         }
 
         let selected = Self::preferred_thread(&self.threads, self.selected_thread_id.as_deref());
+        let previous_selected_thread_id = self.selected_thread_id.clone();
 
         let Some(row) = selected else {
             self.selected_thread_id = None;
@@ -2688,20 +2818,31 @@ impl AppShell {
 
         self.selected_thread_id = Some(row.id.clone());
         self.selected_thread_title = Some(row.title.clone());
-        self.selected_thread_loaded_from_api_id = None;
-        self.loading_selected_thread = false;
-        self.streaming_message_ix = None;
-        self.thread_token_usage = None;
-
-        self.selected_thread_messages.clear();
-        self.reset_live_tool_message_state();
-        self.selected_thread_error = None;
+        if Self::selected_thread_changed(previous_selected_thread_id.as_deref(), row.id.as_str()) {
+            self.selected_thread_loaded_from_api_id = None;
+            self.loading_selected_thread = false;
+            self.streaming_message_ix = None;
+            self.thread_token_usage = None;
+            self.selected_thread_messages.clear();
+            self.reset_live_tool_message_state();
+            self.selected_thread_error = None;
+        }
         self.ensure_composer_options_for_active_workspace(cx);
     }
 
     fn select_thread_by_id(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         self.composing_new_thread_cwd = None;
+        let selected_changed = self.selected_thread_id.as_deref() != Some(thread_id);
         self.selected_thread_id = Some(thread_id.to_string());
+        if selected_changed {
+            self.selected_thread_loaded_from_api_id = None;
+            self.loading_selected_thread = false;
+            self.streaming_message_ix = None;
+            self.thread_token_usage = None;
+            self.selected_thread_messages.clear();
+            self.reset_live_tool_message_state();
+            self.selected_thread_error = None;
+        }
         self.refresh_selected_thread(cx);
     }
 
@@ -3390,7 +3531,11 @@ impl AppShell {
                     Ok(payload) => match Self::parse_thread_rows(payload.clone()) {
                         Ok(rows) => {
                             view.thread_error = None;
-                            view.threads = rows;
+                            view.threads = Self::merge_inflight_rows(
+                                rows,
+                                &view.threads,
+                                &view.inflight_threads,
+                            );
                             for thread in &view.threads {
                                 if !thread.cwd.trim().is_empty() {
                                     view.known_workspace_cwds.insert(thread.cwd.clone());
@@ -3764,6 +3909,16 @@ impl AppShell {
         let mut changed = false;
 
         match notification.method.as_str() {
+            "thread/started" => {
+                if let Some(row) = notification
+                    .params
+                    .get("thread")
+                    .and_then(Self::parse_thread_row_from_value)
+                {
+                    self.upsert_thread_row(row);
+                    changed = true;
+                }
+            }
             "item/agentMessage/delta" => {
                 if !applies_to_selected_thread {
                     return false;
@@ -4154,83 +4309,85 @@ impl AppShell {
                                             .min_w_full()
                                             .font_family(font_mono.clone())
                                             .text_sm()
-                                            .children(file_diff.rows.iter().map(|row| match row {
-                                                diff_view::DiffRow::HunkHeader(h) => div()
-                                                    .w_full()
-                                                    .px(px(12.))
-                                                    .py(px(4.))
-                                                    .bg(surface0)
-                                                    .text_color(subtext_color)
-                                                    .text_xs()
-                                                    .whitespace_nowrap()
-                                                    .child(h.raw.clone())
-                                                    .into_any_element(),
-                                                diff_view::DiffRow::Line(line) => {
-                                                    let (row_bg, bar_color) = match line.kind {
-                                                        diff_view::DiffLineKind::Added => {
-                                                            (added_bg, green_color)
-                                                        }
-                                                        diff_view::DiffLineKind::Removed => {
-                                                            (removed_bg, red_color)
-                                                        }
-                                                        diff_view::DiffLineKind::Context => (
-                                                            gpui::Hsla::transparent_black(),
-                                                            gpui::Hsla::transparent_black(),
-                                                        ),
-                                                    };
-                                                    let old_ln = line.old_lineno.map_or_else(
-                                                        || "\u{00A0}".to_string(),
-                                                        |n| n.to_string(),
-                                                    );
-                                                    let new_ln = line.new_lineno.map_or_else(
-                                                        || "\u{00A0}".to_string(),
-                                                        |n| n.to_string(),
-                                                    );
-                                                    let display_text = if line.text.is_empty() {
-                                                        "\u{00A0}".to_string()
-                                                    } else {
-                                                        line.text.replace(' ', "\u{00A0}")
-                                                    };
-
-                                                    div()
+                                            .children(file_diff.rows.iter().map(|row| {
+                                                match row {
+                                                    diff_view::DiffRow::HunkHeader(h) => div()
                                                         .w_full()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .bg(row_bg)
-                                                        .border_l_3()
-                                                        .border_color(bar_color)
-                                                        .child(
-                                                            div()
-                                                                .w(px(line_number_column_width))
-                                                                .flex_shrink_0()
-                                                                .px(px(6.))
-                                                                .py(px(1.))
-                                                                .text_color(subtext_color)
-                                                                .text_right()
-                                                                .whitespace_nowrap()
-                                                                .child(old_ln),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .w(px(line_number_column_width))
-                                                                .flex_shrink_0()
-                                                                .px(px(6.))
-                                                                .py(px(1.))
-                                                                .text_color(subtext_color)
-                                                                .text_right()
-                                                                .whitespace_nowrap()
-                                                                .child(new_ln),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .flex_shrink_0()
-                                                                .px(px(8.))
-                                                                .py(px(1.))
-                                                                .text_color(text_color)
-                                                                .whitespace_nowrap()
-                                                                .child(display_text),
-                                                        )
-                                                        .into_any_element()
+                                                        .px(px(12.))
+                                                        .py(px(4.))
+                                                        .bg(surface0)
+                                                        .text_color(subtext_color)
+                                                        .text_xs()
+                                                        .whitespace_nowrap()
+                                                        .child(h.raw.clone())
+                                                        .into_any_element(),
+                                                    diff_view::DiffRow::Line(line) => {
+                                                        let (row_bg, bar_color) = match line.kind {
+                                                            diff_view::DiffLineKind::Added => {
+                                                                (added_bg, green_color)
+                                                            }
+                                                            diff_view::DiffLineKind::Removed => {
+                                                                (removed_bg, red_color)
+                                                            }
+                                                            diff_view::DiffLineKind::Context => (
+                                                                gpui::Hsla::transparent_black(),
+                                                                gpui::Hsla::transparent_black(),
+                                                            ),
+                                                        };
+                                                        let old_ln = line.old_lineno.map_or_else(
+                                                            || "\u{00A0}".to_string(),
+                                                            |n| n.to_string(),
+                                                        );
+                                                        let new_ln = line.new_lineno.map_or_else(
+                                                            || "\u{00A0}".to_string(),
+                                                            |n| n.to_string(),
+                                                        );
+                                                        let display_text = if line.text.is_empty() {
+                                                            "\u{00A0}".to_string()
+                                                        } else {
+                                                            line.text.replace(' ', "\u{00A0}")
+                                                        };
+
+                                                        div()
+                                                            .w_full()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .bg(row_bg)
+                                                            .border_l_3()
+                                                            .border_color(bar_color)
+                                                            .child(
+                                                                div()
+                                                                    .w(px(line_number_column_width))
+                                                                    .flex_shrink_0()
+                                                                    .px(px(6.))
+                                                                    .py(px(1.))
+                                                                    .text_color(subtext_color)
+                                                                    .text_right()
+                                                                    .whitespace_nowrap()
+                                                                    .child(old_ln),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .w(px(line_number_column_width))
+                                                                    .flex_shrink_0()
+                                                                    .px(px(6.))
+                                                                    .py(px(1.))
+                                                                    .text_color(subtext_color)
+                                                                    .text_right()
+                                                                    .whitespace_nowrap()
+                                                                    .child(new_ln),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .flex_shrink_0()
+                                                                    .px(px(8.))
+                                                                    .py(px(1.))
+                                                                    .text_color(text_color)
+                                                                    .whitespace_nowrap()
+                                                                    .child(display_text),
+                                                            )
+                                                            .into_any_element()
+                                                    }
                                                 }
                                             })),
                                     ),
@@ -4318,13 +4475,16 @@ impl AppShell {
                             )
                             .child({
                                 if let Some(snapshot) = snapshot {
+                                    let summary = if snapshot.is_git_repository {
+                                        format!("{} · {}", snapshot.branch_name, snapshot.base_ref)
+                                    } else {
+                                        "Git not initialized in this workspace".to_string()
+                                    };
+
                                     div()
                                         .text_xs()
                                         .text_color(subtext_color)
-                                        .child(format!(
-                                            "{} · {}",
-                                            snapshot.branch_name, snapshot.base_ref
-                                        ))
+                                        .child(summary)
                                         .into_any_element()
                                 } else {
                                     div()
@@ -4421,6 +4581,12 @@ impl AppShell {
                         .into_any_element()
                 } else if let Some(snapshot) = snapshot {
                     if snapshot.file_diffs.is_empty() {
+                        let empty_message = if snapshot.is_git_repository {
+                            "No uncommitted changes."
+                        } else {
+                            "No git diff available for this workspace."
+                        };
+
                         div()
                             .w_full()
                             .rounded(px(8.))
@@ -4431,7 +4597,7 @@ impl AppShell {
                             .py(px(8.))
                             .text_sm()
                             .text_color(subtext_color)
-                            .child("No uncommitted changes.")
+                            .child(empty_message)
                             .into_any_element()
                     } else {
                         let file_count = snapshot.file_diffs.len();
@@ -5092,6 +5258,15 @@ impl AppShell {
 
         let skill_items = self.skill_input_items_for_text(&text);
         let turn_input = Self::build_user_turn_input(&text, &images, skill_items);
+        let optimistic_preview = if text.is_empty() {
+            if images.is_empty() {
+                None
+            } else {
+                Some("Please analyze the attached image(s).".to_string())
+            }
+        } else {
+            Some(text.clone())
+        };
 
         cx.spawn(async move |view, cx| {
             let thread_id = if let Some(id) = thread_id {
@@ -5133,13 +5308,32 @@ impl AppShell {
                             });
                             return;
                         }
+                        let mut started_row = payload
+                            .get("thread")
+                            .and_then(Self::parse_thread_row_from_value)
+                            .unwrap_or_else(|| ThreadRow {
+                                id: id.clone(),
+                                title: Self::make_title(None, &id),
+                                updated_at: None,
+                                cwd: cwd.clone(),
+                            });
+                        if started_row.cwd.trim().is_empty() {
+                            started_row.cwd = cwd.clone();
+                        }
+                        if let Some(preview) = optimistic_preview.as_deref()
+                            && Self::is_generated_thread_title(&started_row.title)
+                        {
+                            started_row.title = Self::make_title(Some(preview), &id);
+                        }
+
                         let _ = view.update(cx, |view, cx| {
                             view.pending_new_thread = false;
                             view.inflight_threads.insert(id.clone());
                             view.composing_new_thread_cwd = None;
+                            view.upsert_thread_row(started_row.clone());
                             if view.selected_thread_id.is_none() {
                                 view.selected_thread_id = Some(id.clone());
-                                view.selected_thread_title = Some("New thread".to_string());
+                                view.selected_thread_title = Some(started_row.title.clone());
                             }
                             view.load_threads_from_server(Arc::clone(&server), cx);
                             cx.notify();
@@ -5207,16 +5401,16 @@ impl AppShell {
         mut skill_items: Vec<Value>,
     ) -> Vec<Value> {
         let mut turn_input = Vec::new();
-        for image_path in images {
-            if let Some(path_str) = image_path.to_str() {
-                turn_input.push(json!({ "type": "localImage", "path": path_str }));
-            }
-        }
         if !text.is_empty() {
             turn_input.push(json!({ "type": "text", "text": text }));
         } else if !images.is_empty() {
             turn_input
                 .push(json!({ "type": "text", "text": "Please analyze the attached image(s)." }));
+        }
+        for image_path in images {
+            if let Some(path_str) = image_path.to_str() {
+                turn_input.push(json!({ "type": "localImage", "path": path_str }));
+            }
         }
         turn_input.append(&mut skill_items);
         turn_input
@@ -7427,9 +7621,12 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppShell, RenderableMessage, ThreadSpeaker, file_token_before_cursor};
+    use super::{AppShell, RenderableMessage, ThreadRow, ThreadSpeaker, file_token_before_cursor};
     use serde_json::json;
+    use std::collections::HashSet;
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn format_command_execution_item_includes_metadata_and_output() {
@@ -7660,15 +7857,58 @@ mod tests {
     }
 
     #[test]
-    fn build_user_turn_input_places_images_before_text() {
+    fn collect_branch_diff_snapshot_non_git_workspace_returns_empty_snapshot() {
+        let unique = format!(
+            "agent-hub-non-git-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        );
+        let workspace = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&workspace).expect("should create temp workspace");
+
+        let cwd = workspace
+            .to_str()
+            .expect("temp path should be valid utf-8")
+            .to_string();
+        let snapshot = AppShell::collect_branch_diff_snapshot(&cwd)
+            .expect("non-git workspace should not return an error");
+
+        assert!(!snapshot.is_git_repository);
+        assert!(snapshot.file_diffs.is_empty());
+        assert_eq!(snapshot.total_additions, 0);
+        assert_eq!(snapshot.total_deletions, 0);
+
+        fs::remove_dir_all(workspace).expect("should clean up temp workspace");
+    }
+
+    #[test]
+    fn build_user_turn_input_places_text_before_images() {
         let images = vec![PathBuf::from("/tmp/repo/screenshot.png")];
         let turn_input = AppShell::build_user_turn_input("run ls", &images, Vec::new());
         assert_eq!(turn_input.len(), 2);
+        assert_eq!(turn_input[0], json!({ "type": "text", "text": "run ls" }));
         assert_eq!(
-            turn_input[0],
+            turn_input[1],
             json!({ "type": "localImage", "path": "/tmp/repo/screenshot.png" })
         );
-        assert_eq!(turn_input[1], json!({ "type": "text", "text": "run ls" }));
+    }
+
+    #[test]
+    fn build_user_turn_input_image_only_still_starts_with_text_preview() {
+        let images = vec![PathBuf::from("/tmp/repo/screenshot.png")];
+        let turn_input = AppShell::build_user_turn_input("", &images, Vec::new());
+        assert_eq!(turn_input.len(), 2);
+        assert_eq!(
+            turn_input[0],
+            json!({ "type": "text", "text": "Please analyze the attached image(s)." })
+        );
+        assert_eq!(
+            turn_input[1],
+            json!({ "type": "localImage", "path": "/tmp/repo/screenshot.png" })
+        );
     }
 
     #[test]
@@ -7685,6 +7925,93 @@ mod tests {
             AppShell::extract_turn_id(&json!({ "turn": { "id": 7 } })),
             Some("7".to_string())
         );
+    }
+
+    #[test]
+    fn selected_thread_changed_returns_false_for_same_thread_id() {
+        assert!(!AppShell::selected_thread_changed(Some("thr-1"), "thr-1"));
+    }
+
+    #[test]
+    fn selected_thread_changed_returns_true_when_thread_id_differs() {
+        assert!(AppShell::selected_thread_changed(Some("thr-1"), "thr-2"));
+        assert!(AppShell::selected_thread_changed(None, "thr-1"));
+    }
+
+    #[test]
+    fn parse_thread_row_from_value_parses_thread_payload() {
+        let row = AppShell::parse_thread_row_from_value(&json!({
+            "id": "019c422e-7ff3-7d03-be87-b7dfc6218373",
+            "preview": "what do you see from the image?",
+            "updatedAt": 1770636869,
+            "cwd": "/Users/jk-gan/Developer/my/agent-hub"
+        }))
+        .expect("thread payload should parse");
+
+        assert_eq!(row.id, "019c422e-7ff3-7d03-be87-b7dfc6218373");
+        assert_eq!(row.title, "what do you see from the image?");
+        assert_eq!(row.updated_at, Some(1770636869));
+        assert_eq!(row.cwd, "/Users/jk-gan/Developer/my/agent-hub");
+    }
+
+    #[test]
+    fn merge_inflight_rows_keeps_missing_inflight_threads() {
+        let server_rows = vec![ThreadRow {
+            id: "thr-1".to_string(),
+            title: "older".to_string(),
+            updated_at: Some(10),
+            cwd: "/tmp/repo".to_string(),
+        }];
+        let existing_rows = vec![ThreadRow {
+            id: "thr-new".to_string(),
+            title: "New thread".to_string(),
+            updated_at: Some(20),
+            cwd: "/tmp/repo".to_string(),
+        }];
+        let inflight_threads = HashSet::from(["thr-new".to_string()]);
+
+        let merged = AppShell::merge_inflight_rows(server_rows, &existing_rows, &inflight_threads);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "thr-new");
+        assert_eq!(merged[1].id, "thr-1");
+    }
+
+    #[test]
+    fn merge_inflight_rows_avoids_duplicates_for_same_thread_id() {
+        let server_rows = vec![ThreadRow {
+            id: "thr-new".to_string(),
+            title: "from server".to_string(),
+            updated_at: Some(30),
+            cwd: "/tmp/repo".to_string(),
+        }];
+        let existing_rows = vec![ThreadRow {
+            id: "thr-new".to_string(),
+            title: "local".to_string(),
+            updated_at: Some(20),
+            cwd: "/tmp/repo".to_string(),
+        }];
+        let inflight_threads = HashSet::from(["thr-new".to_string()]);
+
+        let merged = AppShell::merge_inflight_rows(server_rows, &existing_rows, &inflight_threads);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "thr-new");
+        assert_eq!(merged[0].title, "from server");
+    }
+
+    #[test]
+    fn should_skip_selected_thread_fetch_for_state_inflight_with_empty_view_fetches() {
+        assert!(!AppShell::should_skip_selected_thread_fetch_for_state(
+            false, None, "thr-1", true, false
+        ));
+    }
+
+    #[test]
+    fn should_skip_selected_thread_fetch_for_state_inflight_with_messages_skips() {
+        assert!(AppShell::should_skip_selected_thread_fetch_for_state(
+            false, None, "thr-1", true, true
+        ));
     }
 
     #[test]
