@@ -30,7 +30,7 @@ pub(crate) fn render_command_execution_card(
         .flex()
         .justify_start()
         .child(
-            div().w_full().max_w(px(930.)).child(
+            div().w_full().min_w_0().child(
                 Accordion::new(command_row_accordion_id)
                     .item(|this| {
                         this.open(expanded)
@@ -315,7 +315,7 @@ pub(crate) fn render_file_change_card(
         .flex()
         .justify_start()
         .child(
-            div().w_full().max_w(px(930.)).child(
+            div().w_full().min_w_0().child(
                 Accordion::new(file_change_accordion_id)
                     .item(|this| {
                         let header_text = if total_files == 1 {
@@ -506,7 +506,7 @@ pub(crate) fn render_web_search_card(
         .flex()
         .justify_start()
         .child(
-            div().w_full().max_w(px(930.)).child(
+            div().w_full().min_w_0().child(
                 Accordion::new(web_search_accordion_id)
                     .item(|this| {
                         this.open(expanded)

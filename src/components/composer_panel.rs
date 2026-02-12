@@ -71,16 +71,21 @@ pub(crate) fn render(
         && shell.is_authenticated
         && shell._app_server.is_some()
         && shell.has_interrupt_ids();
-    let attached_images = shell.attached_images.clone();
     let model_label = shell.selected_model_label();
     let reasoning_label = shell.selected_reasoning_label();
     let selected_model = shell.selected_model.clone().unwrap_or_default();
     let selected_reasoning_effort = shell.selected_reasoning_effort.clone().unwrap_or_default();
-    let available_models = shell.available_models.clone();
+    let model_menu_items = shell
+        .available_models
+        .iter()
+        .map(|option| (option.model.clone(), option.display_name.clone()))
+        .collect::<Vec<_>>();
+    let has_model_options = !model_menu_items.is_empty();
     let reasoning_efforts = shell.available_reasoning_efforts();
 
     div()
         .w_full()
+        .flex_shrink_0()
         .px(px(24.))
         .pt(px(10.))
         .pb(px(12.))
@@ -89,7 +94,7 @@ pub(crate) fn render(
         .child(
             div()
                 .w_full()
-                .max_w(px(930.))
+                .min_w_0()
                 .bg(mantle)
                 .border_1()
                 .border_color(surface1)
@@ -125,9 +130,9 @@ pub(crate) fn render(
                     ),
                     |this, panel| this.child(panel),
                 )
-                .when(!attached_images.is_empty(), {
+                .when(!shell.attached_images.is_empty(), {
                     let this = this.clone();
-                    let attachment_count = attached_images.len();
+                    let attached_images = shell.attached_images.clone();
                     move |el| {
                         el.child(
                             div()
@@ -140,11 +145,7 @@ pub(crate) fn render(
                                     let file_name = AppShell::image_file_name(path);
                                     let display_name = AppShell::truncate(&file_name, 18);
                                     let path_clone = path.clone();
-                                    let image_ref = path.to_string_lossy().to_string();
-                                    let preview_size = AppShell::composer_attachment_preview_size(
-                                        &image_ref,
-                                        attachment_count,
-                                    );
+                                    let preview_size = AppShell::composer_attachment_preview_size();
                                     let this = this.clone();
 
                                     div()
@@ -547,23 +548,23 @@ pub(crate) fn render(
                                         .dropdown_caret(true)
                                         .text_color(overlay_color)
                                         .disabled(
-                                            shell.loading_model_options || available_models.is_empty(),
+                                            shell.loading_model_options || !has_model_options,
                                         )
                                         .dropdown_menu_with_anchor(gpui::Corner::BottomLeft, {
                                             let this = this.clone();
-                                            let available_models = available_models.clone();
+                                            let model_menu_items = model_menu_items.clone();
                                             let selected_model = selected_model.clone();
                                             move |menu: PopupMenu,
                                                   _window: &mut Window,
                                                   _cx: &mut gpui::Context<PopupMenu>| {
                                                 let mut menu = menu;
-                                                if available_models.is_empty() {
+                                                if model_menu_items.is_empty() {
                                                     return menu.label("No models available");
                                                 }
 
-                                                for option in &available_models {
-                                                    let model = option.model.clone();
-                                                    let label = option.display_name.clone();
+                                                for (model, label) in &model_menu_items {
+                                                    let model = model.clone();
+                                                    let label = label.clone();
                                                     let checked = model == selected_model;
                                                     menu = menu.item(
                                                         PopupMenuItem::new(label)

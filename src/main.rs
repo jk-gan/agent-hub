@@ -536,6 +536,7 @@ struct AppShell {
     approval_selected_ix: usize,
     thread_token_usage: Option<ThreadTokenUsage>,
     attached_images: Vec<PathBuf>,
+    temporary_attachment_paths: HashSet<PathBuf>,
     image_dimensions_by_ref: HashMap<String, (f32, f32)>,
     branch_diff_focus_handle: FocusHandle,
     skill_picker_scroll_handle: ScrollHandle,
@@ -553,6 +554,10 @@ impl AppShell {
     const MAX_RENDERED_THREAD_CHARS: usize = 80_000;
     const MAX_FILE_OPTIONS_PER_WORKSPACE: usize = 20_000;
     const MAX_FILE_PICKER_ITEMS: usize = 500;
+    const SIDEBAR_WIDTH: Pixels = px(300.);
+    const PANEL_DIVIDER_WIDTH: Pixels = px(1.);
+    const CENTER_PANEL_MIN_WIDTH: Pixels = px(560.);
+    const BRANCH_DIFF_PANEL_MIN_WIDTH: Pixels = px(280.);
     const SKIPPED_FILE_PICKER_DIRS: [&'static str; 11] = [
         ".git",
         ".next",
@@ -566,6 +571,29 @@ impl AppShell {
         "dist",
         "build",
     ];
+
+    fn clamped_branch_diff_panel_width(&self, width: Pixels, viewport_width: Pixels) -> Pixels {
+        let sidebar_occupied_width = if self.sidebar_collapsed {
+            px(0.)
+        } else {
+            Self::SIDEBAR_WIDTH + Self::PANEL_DIVIDER_WIDTH
+        };
+        let reserved_for_main =
+            sidebar_occupied_width + Self::CENTER_PANEL_MIN_WIDTH + Self::PANEL_DIVIDER_WIDTH;
+        let max_width = max(
+            viewport_width - reserved_for_main,
+            Self::BRANCH_DIFF_PANEL_MIN_WIDTH,
+        );
+        min(max(width, Self::BRANCH_DIFF_PANEL_MIN_WIDTH), max_width)
+    }
+
+    fn constrain_branch_diff_panel_width(&mut self, viewport_width: Pixels) {
+        let clamped =
+            self.clamped_branch_diff_panel_width(self.branch_diff_panel_width, viewport_width);
+        if self.branch_diff_panel_width != clamped {
+            self.branch_diff_panel_width = clamped;
+        }
+    }
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let expanded_workspace_groups = HashSet::new();
@@ -653,6 +681,7 @@ impl AppShell {
             approval_selected_ix: 0,
             thread_token_usage: None,
             attached_images: Vec::new(),
+            temporary_attachment_paths: HashSet::new(),
             image_dimensions_by_ref: HashMap::new(),
             branch_diff_focus_handle: cx.focus_handle(),
             skill_picker_scroll_handle: ScrollHandle::new(),
@@ -1353,19 +1382,11 @@ impl AppShell {
         let response: SkillsListResponse = serde_json::from_value(payload)
             .map_err(|error| format!("invalid response: {error}"))?;
 
-        let mut workspaces = response.data.into_iter();
-        let first_workspace = workspaces.next();
-        let workspace = first_workspace
-            .map(|first| {
-                if first.cwd == cwd {
-                    first
-                } else {
-                    workspaces
-                        .find(|workspace| workspace.cwd == cwd)
-                        .unwrap_or(first)
-                }
-            })
-            .ok_or_else(|| "skills/list returned no workspace entries".to_string())?;
+        let workspace = response
+            .data
+            .into_iter()
+            .find(|workspace| workspace.cwd == cwd)
+            .ok_or_else(|| format!("skills/list returned no entry for workspace: {cwd}"))?;
 
         let mut skills = workspace
             .skills
@@ -3026,6 +3047,20 @@ impl AppShell {
         })
     }
 
+    fn extract_thread_id(value: &Value) -> Option<String> {
+        Self::value_as_non_empty_id(value.get("threadId"))
+            .or_else(|| {
+                value
+                    .get("thread")
+                    .and_then(|thread| Self::value_as_non_empty_id(thread.get("id")))
+            })
+            .or_else(|| {
+                value
+                    .get("turn")
+                    .and_then(|turn| Self::value_as_non_empty_id(turn.get("threadId")))
+            })
+    }
+
     fn resolve_notification_thread_id(
         &self,
         explicit_thread_id: Option<&str>,
@@ -3045,22 +3080,33 @@ impl AppShell {
             return Some(thread_id.clone());
         }
 
-        if let Some(selected_thread_id) = self.selected_thread_id.as_deref()
-            && (self.inflight_threads.contains(selected_thread_id)
-                || self
-                    .active_turn_id_by_thread
-                    .contains_key(selected_thread_id))
-        {
-            return Some(selected_thread_id.to_string());
-        }
-
-        if self.inflight_threads.len() == 1
-            && let Some(thread_id) = self.inflight_threads.iter().next()
-        {
-            return Some(thread_id.clone());
-        }
-
         None
+    }
+
+    fn is_thread_scoped_notification(method: &str) -> bool {
+        matches!(
+            method,
+            "item/agentMessage/delta"
+                | "item/started"
+                | "item/commandExecution/outputDelta"
+                | "item/fileChange/outputDelta"
+                | "item/completed"
+                | "turn/started"
+                | "turn/completed"
+                | "thread/tokenUsage/updated"
+                | "error"
+        )
+    }
+
+    fn applies_to_selected_thread(
+        selected_thread_id: Option<&str>,
+        resolved_thread_id: Option<&str>,
+        method: &str,
+    ) -> bool {
+        match resolved_thread_id {
+            Some(thread_id) => selected_thread_id == Some(thread_id),
+            None => !Self::is_thread_scoped_notification(method),
+        }
     }
 
     fn can_steer_selected_turn(&self) -> bool {
@@ -3505,6 +3551,8 @@ impl AppShell {
         self.pending_approvals.clear();
         self.approval_selected_ix = 0;
         self.image_dimensions_by_ref.clear();
+        self.attached_images.clear();
+        self.cleanup_all_temporary_attachments();
     }
 
     fn apply_account_read_payload(&mut self, payload: &Value) {
@@ -3897,7 +3945,7 @@ impl AppShell {
         notification: &ServerNotification,
         cx: &mut Context<Self>,
     ) -> bool {
-        if notification.request_id.is_some() {
+        if let Some(request_id) = notification.request_id.clone() {
             if matches!(
                 notification.method.as_str(),
                 "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
@@ -3908,20 +3956,35 @@ impl AppShell {
                     format!("Unsupported server request: {}", notification.method),
                     cx,
                 );
+                if let Some(server) = self._app_server.clone() {
+                    let unsupported_method = notification.method.clone();
+                    cx.spawn(async move |_view, _cx| {
+                        let _ = server
+                            .respond_error(
+                                request_id,
+                                -32601,
+                                format!("Unsupported server request method: {unsupported_method}"),
+                                None,
+                            )
+                            .await;
+                    })
+                    .detach();
+                }
                 return true;
             }
         }
 
-        let notification_thread_id = notification.params.get("threadId").and_then(Value::as_str);
+        let notification_thread_id = Self::extract_thread_id(&notification.params);
         let notification_turn_id = Self::extract_turn_id(&notification.params);
         let resolved_thread_id = self.resolve_notification_thread_id(
-            notification_thread_id,
+            notification_thread_id.as_deref(),
             notification_turn_id.as_deref(),
         );
-        let applies_to_selected_thread = match resolved_thread_id.as_deref() {
-            Some(thread_id) => self.selected_thread_id.as_deref() == Some(thread_id),
-            None => true,
-        };
+        let applies_to_selected_thread = Self::applies_to_selected_thread(
+            self.selected_thread_id.as_deref(),
+            resolved_thread_id.as_deref(),
+            notification.method.as_str(),
+        );
         let mut changed = false;
 
         match notification.method.as_str() {
@@ -4189,6 +4252,7 @@ impl AppShell {
 
     fn render_branch_diff_panel(
         &self,
+        panel_width: Pixels,
         text_color: gpui::Hsla,
         subtext_color: gpui::Hsla,
         overlay_color: gpui::Hsla,
@@ -4204,6 +4268,7 @@ impl AppShell {
     ) -> gpui::AnyElement {
         components::branch_diff_panel::render(
             self,
+            panel_width,
             text_color,
             subtext_color,
             overlay_color,
@@ -4371,6 +4436,40 @@ impl AppShell {
         }
     }
 
+    fn mark_temporary_attachment_path(&mut self, path: &Path) {
+        self.temporary_attachment_paths.insert(path.to_path_buf());
+    }
+
+    fn take_temporary_paths_for_images(&mut self, images: &[PathBuf]) -> Vec<PathBuf> {
+        let mut temporary_paths = Vec::new();
+        for image_path in images {
+            if self.temporary_attachment_paths.remove(image_path) {
+                temporary_paths.push(image_path.clone());
+            }
+        }
+        temporary_paths
+    }
+
+    fn cleanup_temporary_attachment_path(&mut self, path: &Path) {
+        if self.temporary_attachment_paths.remove(path) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn cleanup_temporary_files(paths: &[PathBuf]) {
+        for path in paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn cleanup_all_temporary_attachments(&mut self) {
+        let paths = self
+            .temporary_attachment_paths
+            .drain()
+            .collect::<Vec<PathBuf>>();
+        Self::cleanup_temporary_files(&paths);
+    }
+
     fn add_image_attachment(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if let Some(image_ref) = path.to_str() {
             self.cache_local_image_dimensions_for_ref(image_ref);
@@ -4383,7 +4482,8 @@ impl AppShell {
 
     fn remove_image_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.attached_images.len() {
-            self.attached_images.remove(index);
+            let removed_path = self.attached_images.remove(index);
+            self.cleanup_temporary_attachment_path(&removed_path);
             cx.notify();
         }
     }
@@ -4415,6 +4515,7 @@ impl AppShell {
                         ImageFormat::Ico => "ico",
                     };
                     if let Some(tmp_path) = Self::write_clipboard_image_to_temp(&image.bytes, ext) {
+                        self.mark_temporary_attachment_path(&tmp_path);
                         self.add_image_attachment(tmp_path, cx);
                     }
                 }
@@ -4462,11 +4563,6 @@ impl AppShell {
         ((width * scale).max(1.), (height * scale).max(1.))
     }
 
-    fn message_image_preview_size(image_ref: &str, image_count: usize) -> (f32, f32) {
-        let dimensions = Self::local_image_dimensions(image_ref);
-        Self::message_image_preview_size_from_dimensions(dimensions, image_count)
-    }
-
     fn message_image_preview_size_from_dimensions(
         dimensions: Option<(f32, f32)>,
         image_count: usize,
@@ -4501,7 +4597,7 @@ impl AppShell {
         Self::fit_size_to_bounds(width, height, max_width, max_height)
     }
 
-    fn composer_attachment_preview_size(_image_ref: &str, _attachment_count: usize) -> (f32, f32) {
+    fn composer_attachment_preview_size() -> (f32, f32) {
         (40., 40.)
     }
 
@@ -4606,6 +4702,7 @@ impl AppShell {
 
             let skill_items = self.skill_input_items_for_text(&text);
             let steer_input = Self::build_user_turn_input(&text, &images, skill_items);
+            let temporary_paths = self.take_temporary_paths_for_images(&images);
 
             cx.spawn(async move |view, cx| {
                 let result = server
@@ -4618,6 +4715,7 @@ impl AppShell {
                         }),
                     )
                     .await;
+                Self::cleanup_temporary_files(&temporary_paths);
 
                 let _ = view.update(cx, |view, cx| {
                     if let Err(error) = result
@@ -4661,6 +4759,7 @@ impl AppShell {
 
         let skill_items = self.skill_input_items_for_text(&text);
         let turn_input = Self::build_user_turn_input(&text, &images, skill_items);
+        let temporary_paths = self.take_temporary_paths_for_images(&images);
         let optimistic_preview = if text.is_empty() {
             if images.is_empty() {
                 None
@@ -4709,6 +4808,7 @@ impl AppShell {
                                 }
                                 cx.notify();
                             });
+                            Self::cleanup_temporary_files(&temporary_paths);
                             return;
                         }
                         let mut started_row = payload
@@ -4751,6 +4851,7 @@ impl AppShell {
                             }
                             cx.notify();
                         });
+                        Self::cleanup_temporary_files(&temporary_paths);
                         return;
                     }
                 }
@@ -4794,6 +4895,7 @@ impl AppShell {
                 }
                 cx.notify();
             });
+            Self::cleanup_temporary_files(&temporary_paths);
         })
         .detach();
     }
@@ -4831,6 +4933,10 @@ impl Render for AppShell {
 
         let workspace_groups =
             Self::group_threads_by_workspace(&self.threads, &self.known_workspace_cwds);
+        let branch_diff_panel_width = self.clamped_branch_diff_panel_width(
+            self.branch_diff_panel_width,
+            window.viewport_size().width,
+        );
         let this = cx.entity().downgrade();
         let selected_id = self.selected_thread_id.clone();
         let thread_workspace_items = if self.loading_threads && self.threads.is_empty() {
@@ -5247,9 +5353,8 @@ impl Render for AppShell {
                         return;
                     }
                     let desired_width = event.bounds.right() - event.event.position.x;
-                    let min_width = px(280.);
-                    let max_width = max(event.bounds.size.width - px(320.), min_width);
-                    let clamped_width = min(max(desired_width, min_width), max_width);
+                    let clamped_width = view
+                        .clamped_branch_diff_panel_width(desired_width, event.bounds.size.width);
                     if view.branch_diff_panel_width != clamped_width {
                         view.branch_diff_panel_width = clamped_width;
                         cx.notify();
@@ -5258,7 +5363,7 @@ impl Render for AppShell {
             ))
             .child(
                 Sidebar::<AnySidebarItem>::new("sidebar")
-                    .w(px(300.))
+                    .w(Self::SIDEBAR_WIDTH)
                     .collapsed(self.sidebar_collapsed)
                     .header(div().h_4())
                     .child(
@@ -5414,13 +5519,20 @@ impl Render for AppShell {
                     }),
             )
             .when(!self.sidebar_collapsed, |this| {
-                this.child(div().w(px(1.)).h_full().bg(divider_color))
+                this.child(
+                    div()
+                        .w(Self::PANEL_DIVIDER_WIDTH)
+                        .h_full()
+                        .bg(divider_color),
+                )
             })
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
+                    .min_h_0()
                     .h_full()
+                    .overflow_hidden()
                     .bg(content_bg)
                     .flex()
                     .flex_col()
@@ -5443,10 +5555,14 @@ impl Render for AppShell {
                                     .child(
                                         SidebarToggleButton::new()
                                             .collapsed(sidebar_collapsed)
-                                            .on_click(move |_, _, cx| {
+                                            .on_click(move |_, window, cx| {
+                                                let viewport_width = window.viewport_size().width;
                                                 let _ = entity.update(cx, |view, cx| {
                                                     view.sidebar_collapsed =
                                                         !view.sidebar_collapsed;
+                                                    view.constrain_branch_diff_panel_width(
+                                                        viewport_width,
+                                                    );
                                                     cx.notify();
                                                 });
                                             }),
@@ -5499,10 +5615,15 @@ impl Render for AppShell {
                                             .hover(|this| this.bg(surface0))
                                             .on_mouse_down(
                                                 gpui::MouseButton::Left,
-                                                cx.listener(move |view, _, _, cx| {
+                                                cx.listener(move |view, _, window, cx| {
+                                                    let viewport_width =
+                                                        window.viewport_size().width;
                                                     view.branch_diff_sidebar_open =
                                                         !view.branch_diff_sidebar_open;
                                                     if view.branch_diff_sidebar_open {
+                                                        view.constrain_branch_diff_panel_width(
+                                                            viewport_width,
+                                                        );
                                                         view.branch_diff_needs_refresh = true;
                                                         view.maybe_refresh_branch_diff(cx);
                                                     }
@@ -5555,21 +5676,27 @@ impl Render for AppShell {
             );
 
         if self.branch_diff_sidebar_open {
-            root.child(div().w(px(1.)).h_full().bg(divider_color))
-                .child(self.render_branch_diff_panel(
-                    text_color,
-                    subtext_color,
-                    overlay_color,
-                    surface0,
-                    surface1,
-                    mantle,
-                    divider_color,
-                    red_color,
-                    green_color,
-                    &font_mono,
-                    window,
-                    cx,
-                ))
+            root.child(
+                div()
+                    .w(Self::PANEL_DIVIDER_WIDTH)
+                    .h_full()
+                    .bg(divider_color),
+            )
+            .child(self.render_branch_diff_panel(
+                branch_diff_panel_width,
+                text_color,
+                subtext_color,
+                overlay_color,
+                surface0,
+                surface1,
+                mantle,
+                divider_color,
+                red_color,
+                green_color,
+                &font_mono,
+                window,
+                cx,
+            ))
         } else {
             root
         }
@@ -6037,6 +6164,62 @@ mod tests {
     }
 
     #[test]
+    fn applies_to_selected_thread_is_false_for_unresolved_thread_scoped_notifications() {
+        assert!(!AppShell::applies_to_selected_thread(
+            Some("thr-1"),
+            None,
+            "item/agentMessage/delta",
+        ));
+    }
+
+    #[test]
+    fn applies_to_selected_thread_is_true_for_unresolved_global_notifications() {
+        assert!(AppShell::applies_to_selected_thread(
+            Some("thr-1"),
+            None,
+            "account/updated",
+        ));
+    }
+
+    #[test]
+    fn parse_skills_for_cwd_requires_matching_workspace_entry() {
+        let payload = json!({
+            "data": [
+                {
+                    "cwd": "/tmp/other",
+                    "skills": [
+                        {
+                            "name": "other-skill",
+                            "description": "desc",
+                            "path": "/tmp/other/.agents/other.md",
+                            "enabled": true
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let result = AppShell::parse_skills_for_cwd(payload, "/tmp/repo");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cleanup_temporary_files_removes_paths() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-hub-temp-cleanup-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        ));
+        fs::write(&path, b"temporary").expect("should write temp file");
+        assert!(path.exists());
+
+        AppShell::cleanup_temporary_files(std::slice::from_ref(&path));
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn selected_thread_changed_returns_false_for_same_thread_id() {
         assert!(!AppShell::selected_thread_changed(Some("thr-1"), "thr-1"));
     }
@@ -6143,27 +6326,25 @@ mod tests {
     }
 
     #[test]
-    fn message_image_preview_size_uses_safe_default_for_non_local_images() {
+    fn message_image_preview_size_uses_safe_defaults_without_dimensions() {
         let (single_width, single_height) =
-            AppShell::message_image_preview_size("data:image/png;base64,AAA", 1);
+            AppShell::message_image_preview_size_from_dimensions(None, 1);
         assert!((single_width - 360.).abs() < 0.01);
         assert!((single_height - 220.).abs() < 0.01);
 
         let (multi_width, multi_height) =
-            AppShell::message_image_preview_size("https://example.com/image.png", 3);
+            AppShell::message_image_preview_size_from_dimensions(None, 3);
         assert!((multi_width - 220.).abs() < 0.01);
         assert!((multi_height - 160.).abs() < 0.01);
     }
 
     #[test]
-    fn composer_attachment_preview_size_uses_safe_default_for_non_local_images() {
-        let (single_width, single_height) =
-            AppShell::composer_attachment_preview_size("https://example.com/image.png", 1);
+    fn composer_attachment_preview_size_is_fixed() {
+        let (single_width, single_height) = AppShell::composer_attachment_preview_size();
         assert!((single_width - 40.).abs() < 0.01);
         assert!((single_height - 40.).abs() < 0.01);
 
-        let (multi_width, multi_height) =
-            AppShell::composer_attachment_preview_size("data:image/png;base64,AAA", 3);
+        let (multi_width, multi_height) = AppShell::composer_attachment_preview_size();
         assert!((multi_width - 40.).abs() < 0.01);
         assert!((multi_height - 40.).abs() < 0.01);
     }

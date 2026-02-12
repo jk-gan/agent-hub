@@ -346,6 +346,28 @@ impl AppServer {
             .map_err(|_| AppServerError::Disconnected)
     }
 
+    pub async fn respond_error(
+        &self,
+        request_id: Value,
+        code: i64,
+        message: impl Into<String>,
+        data: Option<Value>,
+    ) -> Result<(), AppServerError> {
+        let msg = serde_json::json!({
+            "id": request_id,
+            "error": {
+                "code": code,
+                "message": message.into(),
+                "data": data,
+            },
+        });
+        let line = serde_json::to_string(&msg)?;
+        self.outgoing_tx
+            .send(line)
+            .await
+            .map_err(|_| AppServerError::Disconnected)
+    }
+
     pub fn notify(&self, method: &str, params: Value) -> Result<(), AppServerError> {
         let msg = serde_json::json!({
             "method": method,

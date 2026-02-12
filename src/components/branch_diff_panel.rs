@@ -7,6 +7,7 @@ use gpui_component::{Icon, IconName};
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render(
     shell: &AppShell,
+    panel_width: gpui::Pixels,
     text_color: gpui::Hsla,
     subtext_color: gpui::Hsla,
     overlay_color: gpui::Hsla,
@@ -28,7 +29,7 @@ pub(crate) fn render(
     div()
         .relative()
         .track_focus(&shell.branch_diff_focus_handle)
-        .w(shell.branch_diff_panel_width)
+        .w(panel_width)
         .h_full()
         .flex_shrink_0()
         .bg(mantle)
