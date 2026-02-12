@@ -603,7 +603,7 @@ impl AppShell {
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Ask Codex anything, @ to add files, / for commands")
+                .placeholder("Ask Codex anything, @ to add files, $ for skills")
                 .auto_grow(1, 8)
         });
 

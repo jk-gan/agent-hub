@@ -1,42 +1,56 @@
 # Agent Hub
 
 Agent Hub is a native desktop client for Codex App Server, built with Rust and GPUI.
-Right now, the product direction is intentionally simple: it is a Codex clone focused on a
-fast local desktop experience.
+Right now, the product direction is intentionally simple: it is a Codex-like client focused on
+fast local desktop performance.
+
+This app is currently 100% vibe-coded with gpt-5.3-codex. I needed a quick, usable alternative
+because the official Codex app felt laggy and drained battery. I may refactor the code and add
+features over time as I keep using it.
 
 ## Current Status
 
 The app already supports the main Codex workflow end to end:
-- account login/logout and session state
-- workspace and thread management
-- streaming turns with live tool output
-- approval handling for command/file-change requests
-- model and reasoning-effort selection
-- image attachments
-- workspace Git diff panel
+
+- Account login/logout and session state
+- Workspace and thread management
+- Streaming turns with live tool output
+- Approval handling for command and file-change requests
+- Model and reasoning-effort selection
+- Image attachments
+- Workspace Git diff panel
 
 ## How It Works
 
 Agent Hub starts `codex app-server` as a child process and communicates over line-delimited
-JSON-RPC on stdio. The UI is implemented in GPUI, and most app state/orchestration currently
+JSON-RPC on stdio. The UI is implemented in GPUI, and most app state and orchestration currently
 lives in `src/main.rs`.
 
 If you want protocol details, the docs in `docs/events/` are a good reference for observed
 request/response/notification payloads.
+
+## Installation
+
+Make sure you have the `codex` CLI installed. Then go to the
+[releases page](https://github.com/jk-gan/agent-hub/releases) to download the latest build.
+
+Only macOS is officially supported right now, because I do not have enough machines to test
+other operating systems yet. Contributions for cross-platform support are very welcome.
 
 ## Local Development
 
 ### Prerequisites
 
 - Rust toolchain (edition 2024 project)
-- Codex CLI with `app-server` support available on your machine
+- Codex CLI with `app-server` support
 - macOS is the primary tested platform for packaging right now
 
 The app tries to find `codex` at:
+
 - `/opt/homebrew/bin/codex`
 - `/usr/local/bin/codex`
 - `~/.cargo/bin/codex`
-- fallback to `codex` from `PATH`
+- then falls back to `codex` from `PATH`
 
 ### Run
 
@@ -59,7 +73,7 @@ cargo packager --release
 ```
 
 The repository also includes a macOS release workflow in `.github/workflows/release.yml`
-for signed/notarized release artifacts.
+for signed and notarized release artifacts.
 
 ## Project Map
 
