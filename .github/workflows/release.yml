@@ -41,33 +41,54 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Package app (sign + notarize app bundle)
+      - name: Package app (codesign)
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY_PATH: ${{ github.workspace }}/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
         run: cargo packager --release --verbose
 
-      - name: Notarize and staple DMG
+      - name: Notarize and staple app + DMG
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY_PATH: ${{ github.workspace }}/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
         run: |
           set -euo pipefail
+          submit_notary() {
+            local file_path="$1"
+            if [ -n "${APPLE_API_ISSUER:-}" ]; then
+              if xcrun notarytool submit "$file_path" \
+                --key-id "$APPLE_API_KEY" \
+                --issuer "$APPLE_API_ISSUER" \
+                --key "$APPLE_API_KEY_PATH" \
+                --wait; then
+                return 0
+              fi
+              echo "Submit with issuer failed. Retrying without issuer (for Individual API key)..."
+            fi
+            xcrun notarytool submit "$file_path" \
+              --key-id "$APPLE_API_KEY" \
+              --key "$APPLE_API_KEY_PATH" \
+              --wait
+          }
+
+          APP_PATH="$(find target/release -maxdepth 1 -name '*.app' -type d | head -1)"
           DMG_PATH="$(find target/release -maxdepth 1 -name '*.dmg' -type f | head -1)"
-          if [ -z "$DMG_PATH" ]; then
-            echo "No DMG found under target/release."
+          if [ -z "$APP_PATH" ] || [ -z "$DMG_PATH" ]; then
+            echo "Expected app and dmg in target/release but did not find them."
+            find target -name '*.app' -type d || true
+            find target -name '*.dmg' -type f || true
             exit 1
           fi
 
-          xcrun notarytool submit "$DMG_PATH" \
-            --key-id "$APPLE_API_KEY" \
-            --issuer "$APPLE_API_ISSUER" \
-            --key "$APPLE_API_KEY_PATH" \
-            --wait
+          APP_ZIP="$RUNNER_TEMP/AgentHub-notary.zip"
+          ditto -c -k --keepParent --sequesterRsrc "$APP_PATH" "$APP_ZIP"
+
+          submit_notary "$APP_ZIP"
+          xcrun stapler staple "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+
+          submit_notary "$DMG_PATH"
           xcrun stapler staple "$DMG_PATH"
           xcrun stapler validate "$DMG_PATH"
 
