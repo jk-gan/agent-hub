@@ -164,19 +164,26 @@ pub(crate) fn render(
                                                                         this.child(
                                                                             div()
                                                                                 .w_full()
+                                                                                .min_w_0()
                                                                                 .bg(surface0)
                                                                                 .rounded(px(14.))
                                                                                 .px(px(14.))
                                                                                 .py(px(10.))
                                                                                 .text_color(text_color)
                                                                                 .child(
-                                                                                    TextView::new(
-                                                                                        &message.view_state,
-                                                                                    )
-                                                                                    .text_color(
-                                                                                        text_color,
-                                                                                    )
-                                                                                    .selectable(true),
+                                                                                    div()
+                                                                                        .w_full()
+                                                                                        .min_w_0()
+                                                                                        .child(
+                                                                                            TextView::new(
+                                                                                                &message.view_state,
+                                                                                            )
+                                                                                            .w_full()
+                                                                                            .text_color(
+                                                                                                text_color,
+                                                                                            )
+                                                                                            .selectable(true),
+                                                                                        ),
                                                                                 ),
                                                                         )
                                                                     }),
@@ -195,28 +202,34 @@ pub(crate) fn render(
                                                                     .min_w_0()
                                                                     .text_color(text_color)
                                                                     .child(
-                                                                        TextView::new(&message.view_state)
-                                                                            .style(
-                                                                                TextViewStyle {
-                                                                                    highlight_theme:
-                                                                                        highlight_theme
-                                                                                            .clone(),
-                                                                                    is_dark,
-                                                                                    ..TextViewStyle::default()
-                                                                                }
-                                                                                .code_block(
-                                                                                    gpui::StyleRefinement::default()
-                                                                                        .bg(mantle)
-                                                                                        .text_color(text_color)
-                                                                                        .border_1()
-                                                                                        .border_color(surface1)
-                                                                                        .rounded(px(6.))
-                                                                                        .px(px(12.))
-                                                                                        .py(px(10.)),
-                                                                                ),
-                                                                            )
-                                                                            .text_color(text_color)
-                                                                            .selectable(true),
+                                                                        div()
+                                                                            .w_full()
+                                                                            .min_w_0()
+                                                                            .child(
+                                                                                TextView::new(&message.view_state)
+                                                                                    .w_full()
+                                                                                    .style(
+                                                                                        TextViewStyle {
+                                                                                            highlight_theme:
+                                                                                                highlight_theme
+                                                                                                    .clone(),
+                                                                                            is_dark,
+                                                                                            ..TextViewStyle::default()
+                                                                                        }
+                                                                                        .code_block(
+                                                                                            gpui::StyleRefinement::default()
+                                                                                                .bg(mantle)
+                                                                                                .text_color(text_color)
+                                                                                                .border_1()
+                                                                                                .border_color(surface1)
+                                                                                                .rounded(px(6.))
+                                                                                                .px(px(12.))
+                                                                                                .py(px(10.)),
+                                                                                        ),
+                                                                                    )
+                                                                                    .text_color(text_color)
+                                                                                    .selectable(true),
+                                                                            ),
                                                                     ),
                                                             )
                                                             .into_any_element(),
