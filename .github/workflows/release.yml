@@ -22,8 +22,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -40,6 +38,9 @@ jobs:
           mkdir -p private_keys
           printf "%s" "$APPLE_API_PRIVATE_KEY" > "private_keys/AuthKey_${APPLE_API_KEY}.p8"
 
+      - name: Build release binary
+        run: cargo build --release
+
       - name: Package app (sign + notarize app bundle)
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -47,7 +48,7 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY_PATH: ${{ github.workspace }}/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
-        run: cargo packager --release --target aarch64-apple-darwin --verbose
+        run: cargo packager --release --verbose
 
       - name: Notarize and staple DMG
         env:
