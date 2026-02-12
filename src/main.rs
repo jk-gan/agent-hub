@@ -554,7 +554,6 @@ impl AppShell {
     const MAX_RENDERED_THREAD_CHARS: usize = 80_000;
     const MAX_FILE_OPTIONS_PER_WORKSPACE: usize = 20_000;
     const MAX_FILE_PICKER_ITEMS: usize = 500;
-    const THREAD_DEBUG_LOG_DIR: &'static str = "logs/thread-debug";
     const THREAD_TRUNCATION_NOTICE: &'static str = "_Thread content truncated for performance._";
     const SIDEBAR_WIDTH: Pixels = px(300.);
     const PANEL_DIVIDER_WIDTH: Pixels = px(1.);
@@ -724,204 +723,6 @@ impl AppShell {
             output.push(ch);
         }
         output
-    }
-
-    fn now_unix_millis() -> u128 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    }
-
-    fn now_unix_nanos() -> u128 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    }
-
-    fn sanitize_log_component(value: &str) -> String {
-        let sanitized = value
-            .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-            .collect::<String>();
-        if sanitized.is_empty() {
-            "unknown".to_string()
-        } else {
-            sanitized
-        }
-    }
-
-    fn thread_debug_log_path(thread_id: &str, suffix: &str) -> PathBuf {
-        let ts = Self::now_unix_nanos();
-        let thread_fragment = Self::sanitize_log_component(thread_id);
-        let suffix = Self::sanitize_log_component(suffix);
-        Path::new(Self::THREAD_DEBUG_LOG_DIR)
-            .join(format!("thread-{thread_fragment}-{ts}-{suffix}.json"))
-    }
-
-    fn write_thread_debug_log(thread_id: &str, suffix: &str, record: &Value) {
-        if fs::create_dir_all(Self::THREAD_DEBUG_LOG_DIR).is_err() {
-            return;
-        }
-        let Ok(serialized) = serde_json::to_string_pretty(record) else {
-            return;
-        };
-        let path = Self::thread_debug_log_path(thread_id, suffix);
-        let _ = fs::write(path, serialized);
-    }
-
-    fn thread_resume_payload_stats(payload: &Value) -> Value {
-        let turns = payload
-            .get("thread")
-            .and_then(|thread| thread.get("turns"))
-            .and_then(Value::as_array);
-
-        let mut item_counts: HashMap<String, usize> = HashMap::new();
-        let mut user_text_chars = 0usize;
-        let mut agent_text_chars = 0usize;
-        let mut command_output_chars = 0usize;
-
-        let mut turn_count = 0usize;
-        let mut item_count = 0usize;
-        if let Some(turns) = turns {
-            turn_count = turns.len();
-            for turn in turns {
-                let Some(items) = turn.get("items").and_then(Value::as_array) else {
-                    continue;
-                };
-                for item in items {
-                    item_count += 1;
-                    let item_type = item
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_string();
-                    *item_counts.entry(item_type.clone()).or_insert(0) += 1;
-
-                    match item_type.as_str() {
-                        "userMessage" => {
-                            if let Some(content) = item.get("content").and_then(Value::as_array) {
-                                for block in content {
-                                    if block.get("type").and_then(Value::as_str) == Some("text") {
-                                        if let Some(text) =
-                                            block.get("text").and_then(Value::as_str)
-                                        {
-                                            user_text_chars += text.chars().count();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        "agentMessage" => {
-                            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                                agent_text_chars += text.chars().count();
-                            }
-                        }
-                        "commandExecution" => {
-                            if let Some(output) =
-                                item.get("aggregatedOutput").and_then(Value::as_str)
-                            {
-                                command_output_chars += output.chars().count();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        let mut item_counts_json = serde_json::Map::new();
-        for (kind, count) in item_counts {
-            item_counts_json.insert(kind, json!(count));
-        }
-
-        json!({
-            "turnCount": turn_count,
-            "itemCount": item_count,
-            "itemCounts": item_counts_json,
-            "userTextChars": user_text_chars,
-            "agentTextChars": agent_text_chars,
-            "commandOutputChars": command_output_chars,
-        })
-    }
-
-    fn renderable_messages_stats(messages: &[RenderableMessage]) -> Value {
-        let mut message_counts: HashMap<String, usize> = HashMap::new();
-        let mut total_chars = 0usize;
-        let mut max_message_chars = 0usize;
-
-        for message in messages {
-            let (kind, chars) = match message {
-                RenderableMessage::Text { content, .. } => ("text", content.chars().count()),
-                RenderableMessage::CommandExecution { content, .. } => {
-                    ("commandExecution", content.chars().count())
-                }
-                RenderableMessage::FileChange { .. } => ("fileChange", 0usize),
-                RenderableMessage::WebSearch { .. } => ("webSearch", 0usize),
-            };
-            *message_counts.entry(kind.to_string()).or_insert(0) += 1;
-            total_chars += chars;
-            max_message_chars = max(max_message_chars, chars);
-        }
-
-        let truncated = messages.iter().any(|message| {
-            matches!(
-                message,
-                RenderableMessage::Text {
-                    content,
-                    speaker: ThreadSpeaker::Assistant,
-                    ..
-                } if content == Self::THREAD_TRUNCATION_NOTICE
-            )
-        });
-
-        let mut message_counts_json = serde_json::Map::new();
-        for (kind, count) in message_counts {
-            message_counts_json.insert(kind, json!(count));
-        }
-
-        json!({
-            "messageCount": messages.len(),
-            "messageCounts": message_counts_json,
-            "totalChars": total_chars,
-            "maxMessageChars": max_message_chars,
-            "truncatedByBudget": truncated,
-            "maxRenderedThreadChars": Self::MAX_RENDERED_THREAD_CHARS,
-        })
-    }
-
-    fn log_thread_resume_payload(thread_id: &str, payload: &Value) {
-        let record = json!({
-            "event": "thread_resume_payload",
-            "timestampMs": Self::now_unix_millis(),
-            "threadId": thread_id,
-            "stats": Self::thread_resume_payload_stats(payload),
-            "payload": payload,
-        });
-        Self::write_thread_debug_log(thread_id, "resume-payload", &record);
-    }
-
-    fn log_thread_resume_rendered(thread_id: &str, messages: &[RenderableMessage]) {
-        let record = json!({
-            "event": "thread_resume_rendered",
-            "timestampMs": Self::now_unix_millis(),
-            "threadId": thread_id,
-            "stats": Self::renderable_messages_stats(messages),
-        });
-        Self::write_thread_debug_log(thread_id, "resume-rendered", &record);
-    }
-
-    fn log_thread_resume_parse_error(thread_id: &str, payload: &Value, error: &str) {
-        let record = json!({
-            "event": "thread_resume_parse_error",
-            "timestampMs": Self::now_unix_millis(),
-            "threadId": thread_id,
-            "error": error,
-            "stats": Self::thread_resume_payload_stats(payload),
-            "payload": payload,
-        });
-        Self::write_thread_debug_log(thread_id, "resume-parse-error", &record);
     }
 
     fn workspace_name(cwd: &str) -> String {
@@ -3126,46 +2927,37 @@ impl AppShell {
                 }
 
                 match response {
-                    Ok(payload) => {
-                        Self::log_thread_resume_payload(selected_thread_id.as_str(), &payload);
-                        match Self::renderable_messages_from_thread_response(&payload) {
-                            Ok(raw) => {
-                                Self::log_thread_resume_rendered(selected_thread_id.as_str(), &raw);
-                                let existing_raw = Self::renderable_messages_from_thread_messages(
-                                    &view.selected_thread_messages,
-                                );
-                                let merged_raw =
-                                    Self::merge_resume_renderable_messages(existing_raw, raw);
-                                view.selected_thread_messages =
-                                    Self::build_messages_from_raw(merged_raw, cx);
-                                view.reset_live_tool_message_state();
-                                let image_refs = view
-                                    .selected_thread_messages
-                                    .iter()
-                                    .flat_map(|message| message.image_refs.iter().cloned())
-                                    .collect::<Vec<_>>();
-                                for image_ref in image_refs {
-                                    view.cache_local_image_dimensions_for_ref(&image_ref);
-                                }
-                                view.selected_thread_error = None;
-                                view.selected_thread_loaded_from_api_id =
-                                    Some(selected_thread_id.clone());
+                    Ok(payload) => match Self::renderable_messages_from_thread_response(&payload) {
+                        Ok(raw) => {
+                            let existing_raw = Self::renderable_messages_from_thread_messages(
+                                &view.selected_thread_messages,
+                            );
+                            let merged_raw =
+                                Self::merge_resume_renderable_messages(existing_raw, raw);
+                            view.selected_thread_messages =
+                                Self::build_messages_from_raw(merged_raw, cx);
+                            view.reset_live_tool_message_state();
+                            let image_refs = view
+                                .selected_thread_messages
+                                .iter()
+                                .flat_map(|message| message.image_refs.iter().cloned())
+                                .collect::<Vec<_>>();
+                            for image_ref in image_refs {
+                                view.cache_local_image_dimensions_for_ref(&image_ref);
                             }
-                            Err(error) => {
-                                Self::log_thread_resume_parse_error(
-                                    selected_thread_id.as_str(),
-                                    &payload,
-                                    &error,
-                                );
-                                view.set_thread_error(
-                                    format!("failed to parse thread/resume response: {error}"),
-                                    cx,
-                                );
-                                view.selected_thread_loaded_from_api_id =
-                                    Some(selected_thread_id.clone());
-                            }
+                            view.selected_thread_error = None;
+                            view.selected_thread_loaded_from_api_id =
+                                Some(selected_thread_id.clone());
                         }
-                    }
+                        Err(error) => {
+                            view.set_thread_error(
+                                format!("failed to parse thread/resume response: {error}"),
+                                cx,
+                            );
+                            view.selected_thread_loaded_from_api_id =
+                                Some(selected_thread_id.clone());
+                        }
+                    },
                     Err(error) => {
                         view.set_thread_error(format!("thread/resume failed: {error}"), cx);
                     }
