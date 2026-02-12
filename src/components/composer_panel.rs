@@ -443,6 +443,7 @@ pub(crate) fn render(
                     div()
                         .w_full()
                         .min_h(px(43.))
+                        .relative()
                         .capture_action(cx.listener(
                             |view, _: &InputMoveUp, window, cx| {
                                 if view.move_completion_picker_selection(-1, cx) {
@@ -492,6 +493,45 @@ pub(crate) fn render(
                                 .h_full()
                                 .text_color(text_color)
                                 .disabled(shell.has_pending_approval() || shell._app_server.is_none()),
+                        )
+                        .child(
+                            div()
+                                .invisible()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .rounded(px(12.))
+                                .border_1()
+                                .border_dashed()
+                                .border_color(blue_color)
+                                .bg(gpui::Hsla {
+                                    h: blue_color.h,
+                                    s: blue_color.s,
+                                    l: blue_color.l,
+                                    a: 0.14,
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .drag_over::<ExternalPaths>(|style, _, _, _| style.visible())
+                                .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
+                                    view.handle_dropped_paths(paths, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .px(px(10.))
+                                        .py(px(4.))
+                                        .rounded(px(999.))
+                                        .bg(surface0)
+                                        .border_1()
+                                        .border_color(surface1)
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(text_color)
+                                        .child("Drop image to attach"),
+                                ),
                         ),
                 )
                 .child(
