@@ -8,6 +8,9 @@ use gpui_component::{Icon, IconName};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+const MESSAGE_CONTAINER_MAX_WIDTH: f32 = 920.0;
+const USER_MESSAGE_MAX_WIDTH: f32 = 680.0;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render(
     shell: &AppShell,
@@ -55,6 +58,7 @@ pub(crate) fn render(
                                 div()
                                     .w_full()
                                     .min_w_0()
+                                    .max_w(px(MESSAGE_CONTAINER_MAX_WIDTH))
                                     .py(px(18.))
                                     .child(if !shell.selected_thread_messages.is_empty() {
                                         let chat_rows = shell
@@ -95,9 +99,8 @@ pub(crate) fn render(
                                                             .justify_end()
                                                             .child(
                                                                 div()
-                                                                    .w_full()
                                                                     .min_w_0()
-                                                                    .max_w(px(700.))
+                                                                    .max_w(px(USER_MESSAGE_MAX_WIDTH))
                                                                     .flex()
                                                                     .flex_col()
                                                                     .items_end()
@@ -108,7 +111,6 @@ pub(crate) fn render(
                                                                         move |this| {
                                                                             this.child(
                                                                                 div()
-                                                                                    .w_full()
                                                                                     .max_w(px(
                                                                                         if image_count <= 1
                                                                                         {
@@ -163,8 +165,9 @@ pub(crate) fn render(
                                                                     .when(has_text, |this| {
                                                                         this.child(
                                                                             div()
-                                                                                .w_full()
-                                                                                .min_w_0()
+                                                                                .max_w(px(
+                                                                                    USER_MESSAGE_MAX_WIDTH,
+                                                                                ))
                                                                                 .bg(surface0)
                                                                                 .rounded(px(14.))
                                                                                 .px(px(14.))
@@ -172,13 +175,10 @@ pub(crate) fn render(
                                                                                 .text_color(text_color)
                                                                                 .child(
                                                                                     div()
-                                                                                        .w_full()
-                                                                                        .min_w_0()
                                                                                         .child(
                                                                                             TextView::new(
                                                                                                 &message.view_state,
                                                                                             )
-                                                                                            .w_full()
                                                                                             .text_color(
                                                                                                 text_color,
                                                                                             )
