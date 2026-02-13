@@ -56,21 +56,17 @@ jobs:
           set -euo pipefail
           submit_notary() {
             local file_path="$1"
-            if [ -n "${APPLE_API_ISSUER:-}" ]; then
-              if xcrun notarytool submit "$file_path" \
-                --key-id "$APPLE_API_KEY" \
-                --issuer "$APPLE_API_ISSUER" \
-                --key "$APPLE_API_KEY_PATH" \
-                --wait; then
-                return 0
-              fi
-              echo "Submit with issuer failed. Retrying without issuer (for Individual API key)..."
-            fi
             xcrun notarytool submit "$file_path" \
               --key-id "$APPLE_API_KEY" \
+              --issuer "$APPLE_API_ISSUER" \
               --key "$APPLE_API_KEY_PATH" \
               --wait
           }
+
+          if [ -z "${APPLE_API_ISSUER:-}" ]; then
+            echo "APPLE_API_ISSUER is required for this notarytool authentication mode."
+            exit 1
+          fi
 
           APP_PATH="$(find target/release -maxdepth 1 -name '*.app' -type d | head -1)"
           DMG_PATH="$(find target/release -maxdepth 1 -name '*.dmg' -type f | head -1)"
