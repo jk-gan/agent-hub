@@ -1,6 +1,7 @@
 use crate::{AppShell, diff_view};
 use gpui::prelude::*;
 use gpui::{Context, ScrollHandle, SharedString, UniformListScrollHandle, Window, div, px};
+use gpui_component::PixelsExt;
 use gpui_component::accordion::Accordion;
 use gpui_component::scroll::ScrollableElement;
 use std::sync::Arc;
@@ -8,6 +9,10 @@ use std::sync::Arc;
 const COMMAND_OUTPUT_MAX_HEIGHT: f32 = 360.;
 const COMMAND_OUTPUT_ROW_HEIGHT: f32 = 24.;
 const FILE_CHANGE_CONTENT_MAX_HEIGHT: f32 = 420.;
+const FILE_DIFF_CARD_GAP: f32 = 12.;
+const FILE_DIFF_HEADER_HEIGHT: f32 = 34.;
+const FILE_DIFF_ROW_HEIGHT: f32 = 22.;
+const FILE_DIFF_VIRTUAL_OVERDRAW_ROWS: f32 = 24.;
 
 fn command_output_panel_height(line_count: usize) -> f32 {
     (line_count.max(1) as f32 * COMMAND_OUTPUT_ROW_HEIGHT).min(COMMAND_OUTPUT_MAX_HEIGHT)
@@ -152,6 +157,127 @@ fn file_diff_content_min_width(
     estimated_width.max(line_number_column_width * 2. + 120.)
 }
 
+fn file_diff_visible_row_range(
+    row_count: usize,
+    rows_top_in_content: gpui::Pixels,
+    viewport_top: gpui::Pixels,
+    viewport_bottom: gpui::Pixels,
+) -> (usize, usize) {
+    if row_count == 0 {
+        return (0, 0);
+    }
+
+    let row_count_f = row_count as f32;
+    let row_height_px = px(FILE_DIFF_ROW_HEIGHT);
+    let rows_total_height = px(row_count_f * FILE_DIFF_ROW_HEIGHT);
+    let rows_bottom_in_content = rows_top_in_content + rows_total_height;
+
+    if viewport_bottom <= rows_top_in_content {
+        return (0, 0);
+    }
+    if viewport_top >= rows_bottom_in_content {
+        return (row_count, row_count);
+    }
+
+    let overdraw = px(FILE_DIFF_VIRTUAL_OVERDRAW_ROWS * FILE_DIFF_ROW_HEIGHT);
+    let local_visible_top = (viewport_top - rows_top_in_content - overdraw).max(px(0.));
+    let local_visible_bottom =
+        (viewport_bottom - rows_top_in_content + overdraw).min(rows_total_height);
+
+    let start = (local_visible_top.as_f32() / row_height_px.as_f32()).floor() as usize;
+    let end = (local_visible_bottom.as_f32() / row_height_px.as_f32()).ceil() as usize;
+    (start.min(row_count), end.min(row_count))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_file_diff_row(
+    row: &diff_view::DiffRow,
+    line_number_column_width: f32,
+    text_color: gpui::Hsla,
+    subtext_color: gpui::Hsla,
+    surface0: gpui::Hsla,
+    added_bg: gpui::Hsla,
+    removed_bg: gpui::Hsla,
+    green_color: gpui::Hsla,
+    red_color: gpui::Hsla,
+) -> gpui::AnyElement {
+    match row {
+        diff_view::DiffRow::HunkHeader(h) => div()
+            .w_full()
+            .h(px(FILE_DIFF_ROW_HEIGHT))
+            .px(px(12.))
+            .py(px(4.))
+            .bg(surface0)
+            .text_color(subtext_color)
+            .text_xs()
+            .whitespace_nowrap()
+            .child(h.raw.clone())
+            .into_any_element(),
+        diff_view::DiffRow::Line(line) => {
+            let (row_bg, bar_color) = match line.kind {
+                diff_view::DiffLineKind::Added => (added_bg, green_color),
+                diff_view::DiffLineKind::Removed => (removed_bg, red_color),
+                diff_view::DiffLineKind::Context => (
+                    gpui::Hsla::transparent_black(),
+                    gpui::Hsla::transparent_black(),
+                ),
+            };
+            let old_ln = line
+                .old_lineno
+                .map_or_else(|| "\u{00A0}".to_string(), |n| n.to_string());
+            let new_ln = line
+                .new_lineno
+                .map_or_else(|| "\u{00A0}".to_string(), |n| n.to_string());
+            let display_text = if line.text.is_empty() {
+                "\u{00A0}".to_string()
+            } else {
+                line.text.replace(' ', "\u{00A0}")
+            };
+
+            div()
+                .w_full()
+                .h(px(FILE_DIFF_ROW_HEIGHT))
+                .flex()
+                .flex_row()
+                .bg(row_bg)
+                .border_l_3()
+                .border_color(bar_color)
+                .child(
+                    div()
+                        .w(px(line_number_column_width))
+                        .flex_shrink_0()
+                        .px(px(6.))
+                        .py(px(1.))
+                        .text_color(subtext_color)
+                        .text_right()
+                        .whitespace_nowrap()
+                        .child(old_ln),
+                )
+                .child(
+                    div()
+                        .w(px(line_number_column_width))
+                        .flex_shrink_0()
+                        .px(px(6.))
+                        .py(px(1.))
+                        .text_color(subtext_color)
+                        .text_right()
+                        .whitespace_nowrap()
+                        .child(new_ln),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(8.))
+                        .py(px(1.))
+                        .text_color(text_color)
+                        .whitespace_nowrap()
+                        .child(display_text),
+                )
+                .into_any_element()
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_file_diff_cards(
     file_diffs: &[diff_view::ParsedFileDiff],
@@ -166,6 +292,39 @@ pub(crate) fn render_file_diff_cards(
     window: &mut Window,
     cx: &mut Context<AppShell>,
 ) -> Vec<gpui::AnyElement> {
+    render_file_diff_cards_virtualized(
+        file_diffs,
+        text_color,
+        subtext_color,
+        surface0,
+        surface1,
+        mantle,
+        green_color,
+        red_color,
+        font_mono,
+        px(0.),
+        px(f32::MAX),
+        window,
+        cx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_file_diff_cards_virtualized(
+    file_diffs: &[diff_view::ParsedFileDiff],
+    text_color: gpui::Hsla,
+    subtext_color: gpui::Hsla,
+    surface0: gpui::Hsla,
+    surface1: gpui::Hsla,
+    mantle: gpui::Hsla,
+    green_color: gpui::Hsla,
+    red_color: gpui::Hsla,
+    font_mono: &gpui::SharedString,
+    viewport_top: gpui::Pixels,
+    viewport_bottom: gpui::Pixels,
+    window: &mut Window,
+    cx: &mut Context<AppShell>,
+) -> Vec<gpui::AnyElement> {
     let added_bg = gpui::Hsla {
         a: 0.12,
         ..green_color
@@ -175,9 +334,11 @@ pub(crate) fn render_file_diff_cards(
         ..red_color
     };
 
+    let mut content_cursor = px(0.);
     file_diffs
         .iter()
-        .map(|file_diff| {
+        .enumerate()
+        .map(|(file_diff_ix, file_diff)| {
             let total_add = file_diff.additions;
             let total_del = file_diff.deletions;
             let path = file_diff.path.clone();
@@ -191,6 +352,24 @@ pub(crate) fn render_file_diff_cards(
             let line_number_column_width = file_diff_line_number_column_width(file_diff);
             let content_min_width =
                 file_diff_content_min_width(file_diff, line_number_column_width);
+            let rows_top_in_content = content_cursor + px(FILE_DIFF_HEADER_HEIGHT);
+            let row_count = file_diff.rows.len();
+            let rows_total_height = px(row_count as f32 * FILE_DIFF_ROW_HEIGHT);
+            let (visible_start, visible_end) = file_diff_visible_row_range(
+                row_count,
+                rows_top_in_content,
+                viewport_top,
+                viewport_bottom,
+            );
+            let before_rows = visible_start;
+            let after_rows = row_count.saturating_sub(visible_end);
+            let before_spacer_height = px(before_rows as f32 * FILE_DIFF_ROW_HEIGHT);
+            let after_spacer_height = px(after_rows as f32 * FILE_DIFF_ROW_HEIGHT);
+            let is_last = file_diff_ix + 1 == file_diffs.len();
+            content_cursor += px(FILE_DIFF_HEADER_HEIGHT) + rows_total_height;
+            if !is_last {
+                content_cursor += px(FILE_DIFF_CARD_GAP);
+            }
 
             div()
                 .flex()
@@ -202,6 +381,7 @@ pub(crate) fn render_file_diff_cards(
                 .child(
                     div()
                         .w_full()
+                        .h(px(FILE_DIFF_HEADER_HEIGHT))
                         .px(px(12.))
                         .py(px(8.))
                         .bg(mantle)
@@ -249,87 +429,29 @@ pub(crate) fn render_file_diff_cards(
                                         .min_w_full()
                                         .font_family(font_mono.clone())
                                         .text_sm()
-                                        .children(file_diff.rows.iter().map(|row| {
-                                            match row {
-                                                diff_view::DiffRow::HunkHeader(h) => div()
-                                                    .w_full()
-                                                    .px(px(12.))
-                                                    .py(px(4.))
-                                                    .bg(surface0)
-                                                    .text_color(subtext_color)
-                                                    .text_xs()
-                                                    .whitespace_nowrap()
-                                                    .child(h.raw.clone())
-                                                    .into_any_element(),
-                                                diff_view::DiffRow::Line(line) => {
-                                                    let (row_bg, bar_color) = match line.kind {
-                                                        diff_view::DiffLineKind::Added => {
-                                                            (added_bg, green_color)
-                                                        }
-                                                        diff_view::DiffLineKind::Removed => {
-                                                            (removed_bg, red_color)
-                                                        }
-                                                        diff_view::DiffLineKind::Context => (
-                                                            gpui::Hsla::transparent_black(),
-                                                            gpui::Hsla::transparent_black(),
-                                                        ),
-                                                    };
-                                                    let old_ln = line.old_lineno.map_or_else(
-                                                        || "\u{00A0}".to_string(),
-                                                        |n| n.to_string(),
-                                                    );
-                                                    let new_ln = line.new_lineno.map_or_else(
-                                                        || "\u{00A0}".to_string(),
-                                                        |n| n.to_string(),
-                                                    );
-                                                    let display_text = if line.text.is_empty() {
-                                                        "\u{00A0}".to_string()
-                                                    } else {
-                                                        line.text.replace(' ', "\u{00A0}")
-                                                    };
-
-                                                    div()
-                                                        .w_full()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .bg(row_bg)
-                                                        .border_l_3()
-                                                        .border_color(bar_color)
-                                                        .child(
-                                                            div()
-                                                                .w(px(line_number_column_width))
-                                                                .flex_shrink_0()
-                                                                .px(px(6.))
-                                                                .py(px(1.))
-                                                                .text_color(subtext_color)
-                                                                .text_right()
-                                                                .whitespace_nowrap()
-                                                                .child(old_ln),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .w(px(line_number_column_width))
-                                                                .flex_shrink_0()
-                                                                .px(px(6.))
-                                                                .py(px(1.))
-                                                                .text_color(subtext_color)
-                                                                .text_right()
-                                                                .whitespace_nowrap()
-                                                                .child(new_ln),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .flex_shrink_0()
-                                                                .px(px(8.))
-                                                                .py(px(1.))
-                                                                .text_color(text_color)
-                                                                .whitespace_nowrap()
-                                                                .child(display_text),
-                                                        )
-                                                        .into_any_element()
-                                                }
-                                            }
-                                        })),
+                                        .when(before_spacer_height > px(0.), |this| {
+                                            this.child(div().w_full().h(before_spacer_height))
+                                        })
+                                        .children(
+                                            file_diff.rows[visible_start..visible_end].iter().map(
+                                                |row| {
+                                                    render_file_diff_row(
+                                                        row,
+                                                        line_number_column_width,
+                                                        text_color,
+                                                        subtext_color,
+                                                        surface0,
+                                                        added_bg,
+                                                        removed_bg,
+                                                        green_color,
+                                                        red_color,
+                                                    )
+                                                },
+                                            ),
+                                        )
+                                        .when(after_spacer_height > px(0.), |this| {
+                                            this.child(div().w_full().h(after_spacer_height))
+                                        }),
                                 ),
                         )
                         .horizontal_scrollbar(&horizontal_scroll_handle),
@@ -363,6 +485,8 @@ pub(crate) fn render_file_change_card(
         .use_keyed_state(file_change_scroll_state_id, cx, |_, _| ScrollHandle::new())
         .read(cx)
         .clone();
+    let viewport_top = -file_change_scroll_handle.offset().y;
+    let viewport_bottom = viewport_top + px(FILE_CHANGE_CONTENT_MAX_HEIGHT);
     let status_label = status_label.to_string();
     let total_files = file_diffs.len();
 
@@ -399,7 +523,7 @@ pub(crate) fn render_file_change_card(
                                         ))
                                         .child(
                                             div().w_full().flex().flex_col().gap(px(12.)).children(
-                                                render_file_diff_cards(
+                                                render_file_diff_cards_virtualized(
                                                     file_diffs,
                                                     text_color,
                                                     subtext_color,
@@ -409,6 +533,8 @@ pub(crate) fn render_file_change_card(
                                                     green_color,
                                                     red_color,
                                                     font_mono,
+                                                    viewport_top,
+                                                    viewport_bottom,
                                                     window,
                                                     cx,
                                                 ),
