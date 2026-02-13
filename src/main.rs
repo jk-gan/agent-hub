@@ -368,6 +368,7 @@ struct ThreadMessage {
     speaker: ThreadSpeaker,
     content: String,
     image_refs: Vec<String>,
+    command_output_lines: Arc<Vec<gpui::SharedString>>,
     view_state: Entity<TextViewState>,
     kind: ThreadMessageKind,
 }
@@ -2018,6 +2019,35 @@ impl AppShell {
         cx.new(|cx| TextViewState::markdown(text, cx))
     }
 
+    fn empty_command_output_lines() -> Arc<Vec<gpui::SharedString>> {
+        Arc::new(Vec::new())
+    }
+
+    fn command_execution_display_lines(content: &str) -> Arc<Vec<gpui::SharedString>> {
+        let normalized = Self::normalize_tool_output_text(content);
+        let mut lines: Vec<String> = normalized.split('\n').map(ToOwned::to_owned).collect();
+
+        if lines
+            .first()
+            .is_some_and(|line| line.trim_start().starts_with("```"))
+            && let Some(last_fence_ix) = lines
+                .iter()
+                .rposition(|line| line.trim_start().starts_with("```"))
+            && last_fence_ix > 0
+        {
+            lines.remove(last_fence_ix);
+            lines.remove(0);
+        }
+
+        for line in &mut lines {
+            if line.contains("cwd `") || line.contains("exit `") {
+                *line = line.replace('`', "");
+            }
+        }
+
+        Arc::new(lines.into_iter().map(gpui::SharedString::from).collect())
+    }
+
     fn set_thread_error(&mut self, message: String, cx: &mut Context<Self>) {
         let view_state = cx.new(|cx| TextViewState::markdown(&message, cx));
         self.selected_thread_error = Some((message, view_state));
@@ -2034,6 +2064,7 @@ impl AppShell {
             speaker,
             content,
             image_refs,
+            command_output_lines: Self::empty_command_output_lines(),
             view_state,
             kind: ThreadMessageKind::Text,
         }
@@ -2055,11 +2086,13 @@ impl AppShell {
                 content,
                 expanded,
             } => {
-                let view_state = Self::new_message_state(&content, cx);
+                let command_output_lines = Self::command_execution_display_lines(&content);
+                let view_state = Self::new_message_state("", cx);
                 ThreadMessage {
                     speaker: ThreadSpeaker::Assistant,
                     content,
                     image_refs: Vec::new(),
+                    command_output_lines,
                     view_state,
                     kind: ThreadMessageKind::CommandExecution {
                         header,
@@ -2078,6 +2111,7 @@ impl AppShell {
                     speaker: ThreadSpeaker::Assistant,
                     content: String::new(),
                     image_refs: Vec::new(),
+                    command_output_lines: Self::empty_command_output_lines(),
                     view_state,
                     kind: ThreadMessageKind::FileChange {
                         status_label,
@@ -2092,6 +2126,7 @@ impl AppShell {
                     speaker: ThreadSpeaker::Assistant,
                     content: String::new(),
                     image_refs: Vec::new(),
+                    command_output_lines: Self::empty_command_output_lines(),
                     view_state,
                     kind: ThreadMessageKind::WebSearch { details, expanded },
                 }
@@ -2215,6 +2250,7 @@ impl AppShell {
                 message.speaker = speaker;
                 message.content = content.clone();
                 message.image_refs = image_refs;
+                message.command_output_lines = Self::empty_command_output_lines();
                 message.view_state = Self::new_message_state(&content, cx);
                 message.kind = ThreadMessageKind::Text;
             }
@@ -2232,7 +2268,8 @@ impl AppShell {
                 message.speaker = ThreadSpeaker::Assistant;
                 message.content = content.clone();
                 message.image_refs.clear();
-                message.view_state = Self::new_message_state(&content, cx);
+                message.command_output_lines = Self::command_execution_display_lines(&content);
+                message.view_state = Self::new_message_state("", cx);
                 message.kind = ThreadMessageKind::CommandExecution {
                     header,
                     status_label,
@@ -2252,6 +2289,7 @@ impl AppShell {
                 message.speaker = ThreadSpeaker::Assistant;
                 message.content = String::new();
                 message.image_refs.clear();
+                message.command_output_lines = Self::empty_command_output_lines();
                 message.view_state = Self::new_message_state("", cx);
                 message.kind = ThreadMessageKind::FileChange {
                     status_label,
@@ -2268,6 +2306,7 @@ impl AppShell {
                 message.speaker = ThreadSpeaker::Assistant;
                 message.content = String::new();
                 message.image_refs.clear();
+                message.command_output_lines = Self::empty_command_output_lines();
                 message.view_state = Self::new_message_state("", cx);
                 message.kind = ThreadMessageKind::WebSearch {
                     details,
@@ -2321,21 +2360,20 @@ impl AppShell {
                 existing.content.push('\n');
             }
             existing.content.push_str(&normalized_delta);
-            let rendered_markdown = Self::live_tool_output_markdown(&existing.content);
-            existing.view_state.update(cx, |state, cx| {
-                state.set_text(&rendered_markdown, cx);
-            });
+            existing.command_output_lines =
+                Self::command_execution_display_lines(&existing.content);
             self.scroll_handle.scroll_to_bottom();
             return;
         }
 
         let content = normalized_delta;
-        let rendered_markdown = Self::live_tool_output_markdown(&content);
-        let view_state = Self::new_message_state(&rendered_markdown, cx);
+        let command_output_lines = Self::command_execution_display_lines(&content);
+        let view_state = Self::new_message_state("", cx);
         self.selected_thread_messages.push(ThreadMessage {
             speaker: ThreadSpeaker::Assistant,
             content,
             image_refs: Vec::new(),
+            command_output_lines,
             view_state,
             kind: ThreadMessageKind::CommandExecution {
                 header: default_header.to_string(),
@@ -2378,11 +2416,6 @@ impl AppShell {
             Some(lang) if !lang.is_empty() => format!("{fence}{lang}\n{content}\n{fence}"),
             _ => format!("{fence}\n{content}\n{fence}"),
         }
-    }
-
-    fn live_tool_output_markdown(output: &str) -> String {
-        let output = output.trim_end_matches('\n');
-        Self::fenced_code_block(Some("text"), output)
     }
 
     fn budgeted_content(

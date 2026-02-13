@@ -1,11 +1,17 @@
 use crate::{AppShell, diff_view};
 use gpui::prelude::*;
-use gpui::{Context, Entity, ScrollHandle, Window, div, px};
+use gpui::{Context, ScrollHandle, SharedString, UniformListScrollHandle, Window, div, px};
 use gpui_component::accordion::Accordion;
-use gpui_component::highlighter::HighlightTheme;
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use std::sync::Arc;
+
+const COMMAND_OUTPUT_MAX_HEIGHT: f32 = 360.;
+const COMMAND_OUTPUT_ROW_HEIGHT: f32 = 24.;
+const FILE_CHANGE_CONTENT_MAX_HEIGHT: f32 = 420.;
+
+fn command_output_panel_height(line_count: usize) -> f32 {
+    (line_count.max(1) as f32 * COMMAND_OUTPUT_ROW_HEIGHT).min(COMMAND_OUTPUT_MAX_HEIGHT)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_command_execution_card(
@@ -13,16 +19,26 @@ pub(crate) fn render_command_execution_card(
     header: &str,
     status_label: &str,
     expanded: bool,
-    view_state: &Entity<TextViewState>,
-    highlight_theme: Arc<HighlightTheme>,
-    is_dark: bool,
+    command_output_lines: Arc<Vec<SharedString>>,
     text_color: gpui::Hsla,
     surface0: gpui::Hsla,
+    font_mono: &SharedString,
+    window: &mut Window,
     cx: &mut Context<AppShell>,
 ) -> gpui::AnyElement {
     let command_row_accordion_id = format!("command-row-{message_ix}");
+    let command_output_scroll_state_id = format!("command-output-scroll-state-{message_ix}");
+    let command_output_line_count = command_output_lines.len().max(1);
+    let command_output_scroll_handle = window
+        .use_keyed_state(command_output_scroll_state_id, cx, |_, _| {
+            UniformListScrollHandle::new()
+        })
+        .read(cx)
+        .clone();
+    let command_output_height = command_output_panel_height(command_output_line_count);
     let header = header.to_string();
     let status_label = status_label.to_string();
+    let font_mono = font_mono.clone();
 
     div()
         .w_full()
@@ -36,24 +52,59 @@ pub(crate) fn render_command_execution_card(
                         this.open(expanded)
                             .title(format!("{header} · {status_label}"))
                             .child(
-                                TextView::new(view_state)
-                                    .style(
-                                        TextViewStyle {
-                                            highlight_theme,
-                                            is_dark,
-                                            ..TextViewStyle::default()
-                                        }
-                                        .code_block(
-                                            gpui::StyleRefinement::default()
-                                                .bg(surface0)
-                                                .text_color(text_color)
-                                                .rounded(px(6.))
-                                                .px(px(12.))
-                                                .py(px(10.)),
-                                        ),
+                                div()
+                                    .w_full()
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(surface0)
+                                    .bg(surface0)
+                                    .overflow_hidden()
+                                    .relative()
+                                    .child(
+                                        gpui::uniform_list(
+                                            format!("command-output-list-{message_ix}"),
+                                            command_output_line_count,
+                                            {
+                                            let command_output_lines = command_output_lines.clone();
+                                            let font_mono = font_mono.clone();
+                                            move |range, _, _| {
+                                                range
+                                                    .map(|line_ix| {
+                                                        let line = command_output_lines
+                                                            .get(line_ix)
+                                                            .cloned()
+                                                            .unwrap_or_default();
+
+                                                        div()
+                                                            .id(format!(
+                                                                "command-output-line-{message_ix}-{line_ix}"
+                                                            ))
+                                                            .w_full()
+                                                            .h(px(COMMAND_OUTPUT_ROW_HEIGHT))
+                                                            .px(px(12.))
+                                                            .py(px(2.))
+                                                            .font_family(font_mono.clone())
+                                                            .text_sm()
+                                                            .text_color(text_color)
+                                                            .whitespace_nowrap()
+                                                            .overflow_hidden()
+                                                            .child(line)
+                                                            .into_any_element()
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            }
+                                            }
+                                        )
+                                        .track_scroll(&command_output_scroll_handle)
+                                        .w_full()
+                                        .h(px(command_output_height)),
                                     )
-                                    .text_color(text_color)
-                                    .selectable(true),
+                                    .on_scroll_wheel(cx.listener(
+                                        |_, _: &gpui::ScrollWheelEvent, _, cx| {
+                                            cx.stop_propagation();
+                                        },
+                                    ))
+                                    .vertical_scrollbar(&command_output_scroll_handle),
                             )
                     })
                     .on_toggle_click(cx.listener(move |view, open_ixs: &[usize], _, cx| {
@@ -306,6 +357,12 @@ pub(crate) fn render_file_change_card(
     cx: &mut Context<AppShell>,
 ) -> gpui::AnyElement {
     let file_change_accordion_id = format!("file-change-{message_ix}");
+    let file_change_scroll_id = format!("file-change-scroll-{message_ix}");
+    let file_change_scroll_state_id = format!("file-change-scroll-state-{message_ix}");
+    let file_change_scroll_handle = window
+        .use_keyed_state(file_change_scroll_state_id, cx, |_, _| ScrollHandle::new())
+        .read(cx)
+        .clone();
     let status_label = status_label.to_string();
     let total_files = file_diffs.len();
 
@@ -326,22 +383,39 @@ pub(crate) fn render_file_change_card(
 
                         this.open(expanded).title(header_text).child(
                             div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(12.))
-                                .children(render_file_diff_cards(
-                                    file_diffs,
-                                    text_color,
-                                    subtext_color,
-                                    surface0,
-                                    surface1,
-                                    mantle,
-                                    green_color,
-                                    red_color,
-                                    font_mono,
-                                    window,
-                                    cx,
-                                )),
+                                .w_full()
+                                .relative()
+                                .child(
+                                    div()
+                                        .id(file_change_scroll_id)
+                                        .w_full()
+                                        .max_h(px(FILE_CHANGE_CONTENT_MAX_HEIGHT))
+                                        .overflow_y_scroll()
+                                        .track_scroll(&file_change_scroll_handle)
+                                        .on_scroll_wheel(cx.listener(
+                                            |_, _: &gpui::ScrollWheelEvent, _, cx| {
+                                                cx.stop_propagation();
+                                            },
+                                        ))
+                                        .child(
+                                            div().w_full().flex().flex_col().gap(px(12.)).children(
+                                                render_file_diff_cards(
+                                                    file_diffs,
+                                                    text_color,
+                                                    subtext_color,
+                                                    surface0,
+                                                    surface1,
+                                                    mantle,
+                                                    green_color,
+                                                    red_color,
+                                                    font_mono,
+                                                    window,
+                                                    cx,
+                                                ),
+                                            ),
+                                        ),
+                                )
+                                .vertical_scrollbar(&file_change_scroll_handle),
                         )
                     })
                     .on_toggle_click(cx.listener(move |view, open_ixs: &[usize], _, cx| {
