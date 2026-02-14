@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,9 +16,13 @@ jobs:
     name: Build macOS (Apple Silicon)
     runs-on: macos-14
     environment: prod
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -45,15 +49,16 @@ jobs:
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: cargo packager --release --verbose
+        run: cargo packager --release
 
       - name: Notarize and staple app + DMG
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY_PATH: ${{ github.workspace }}/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
         run: |
           set -euo pipefail
+          APPLE_API_KEY_PATH="${GITHUB_WORKSPACE}/private_keys/AuthKey_${APPLE_API_KEY}.p8"
+
           submit_notary() {
             local file_path="$1"
             xcrun notarytool submit "$file_path" \
@@ -88,6 +93,11 @@ jobs:
           xcrun stapler staple "$DMG_PATH"
           xcrun stapler validate "$DMG_PATH"
 
+      - name: Cleanup signing key material
+        if: always()
+        run: |
+          rm -rf private_keys
+
       - name: Prepare artifacts
         run: |
           mkdir -p dist
@@ -118,9 +128,13 @@ jobs:
     name: Create GitHub Release
     needs: build-macos
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
