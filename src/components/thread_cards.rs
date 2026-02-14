@@ -279,7 +279,7 @@ fn render_file_diff_row(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn render_file_diff_cards(
+pub(crate) fn render_file_diff_cards_for_viewport(
     file_diffs: &[diff_view::ParsedFileDiff],
     text_color: gpui::Hsla,
     subtext_color: gpui::Hsla,
@@ -289,6 +289,8 @@ pub(crate) fn render_file_diff_cards(
     green_color: gpui::Hsla,
     red_color: gpui::Hsla,
     font_mono: &gpui::SharedString,
+    viewport_top: gpui::Pixels,
+    viewport_bottom: gpui::Pixels,
     window: &mut Window,
     cx: &mut Context<AppShell>,
 ) -> Vec<gpui::AnyElement> {
@@ -302,8 +304,8 @@ pub(crate) fn render_file_diff_cards(
         green_color,
         red_color,
         font_mono,
-        px(0.),
-        px(f32::MAX),
+        viewport_top,
+        viewport_bottom,
         window,
         cx,
     )

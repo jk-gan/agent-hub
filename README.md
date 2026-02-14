@@ -1,4 +1,11 @@
-# Agent Hub
+<p align="center">
+  <img alt="Agent Hub" src=".github/media/app-screenshot.png" width="650">
+  <h1 align="center">
+	  Agent Hub
+  </h1>
+</p>
+
+<p align="center">Codex App Clone in Rust</p>
 
 Agent Hub is a native desktop client for Codex App Server, built with Rust and GPUI.
 Right now, the product direction is intentionally simple: it is a Codex-like client focused on

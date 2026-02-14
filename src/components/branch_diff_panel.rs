@@ -1,8 +1,44 @@
 use crate::{AppShell, DraggedBranchDiffSidebarResize};
 use gpui::prelude::*;
 use gpui::{Context, Window, div, px};
+use gpui_component::PixelsExt;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{Icon, IconName};
+
+const BRANCH_DIFF_FILE_LIST_ROW_HEIGHT: f32 = 30.;
+const BRANCH_DIFF_FILE_LIST_OVERDRAW_ROWS: f32 = 20.;
+const BRANCH_DIFF_FILE_LIST_INNER_Y_PADDING: f32 = 6.;
+
+fn visible_row_range(
+    row_count: usize,
+    rows_top_in_content: gpui::Pixels,
+    row_height: gpui::Pixels,
+    viewport_top: gpui::Pixels,
+    viewport_bottom: gpui::Pixels,
+    overdraw_rows: f32,
+) -> (usize, usize) {
+    if row_count == 0 {
+        return (0, 0);
+    }
+
+    let rows_total_height = px(row_count as f32 * row_height.as_f32());
+    let rows_bottom_in_content = rows_top_in_content + rows_total_height;
+    if viewport_bottom <= rows_top_in_content {
+        return (0, 0);
+    }
+    if viewport_top >= rows_bottom_in_content {
+        return (row_count, row_count);
+    }
+
+    let overdraw = px(overdraw_rows * row_height.as_f32());
+    let local_visible_top = (viewport_top - rows_top_in_content - overdraw).max(px(0.));
+    let local_visible_bottom =
+        (viewport_bottom - rows_top_in_content + overdraw).min(rows_total_height);
+
+    let start = (local_visible_top.as_f32() / row_height.as_f32()).floor() as usize;
+    let end = (local_visible_bottom.as_f32() / row_height.as_f32()).ceil() as usize;
+    (start.min(row_count), end.min(row_count))
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render(
@@ -213,6 +249,26 @@ pub(crate) fn render(
                     } else {
                         format!("{file_count} files")
                     };
+                    let viewport_height = window.viewport_size().height;
+                    let file_list_viewport_top = -shell.branch_diff_file_list_scroll_handle.offset().y;
+                    let file_list_viewport_bottom = file_list_viewport_top + viewport_height;
+                    let file_list_row_height = px(BRANCH_DIFF_FILE_LIST_ROW_HEIGHT);
+                    let (file_list_visible_start, file_list_visible_end) = visible_row_range(
+                        file_count,
+                        px(BRANCH_DIFF_FILE_LIST_INNER_Y_PADDING),
+                        file_list_row_height,
+                        file_list_viewport_top,
+                        file_list_viewport_bottom,
+                        BRANCH_DIFF_FILE_LIST_OVERDRAW_ROWS,
+                    );
+                    let file_list_before_rows = file_list_visible_start;
+                    let file_list_after_rows = file_count.saturating_sub(file_list_visible_end);
+                    let file_list_before_spacer_height =
+                        px(file_list_before_rows as f32 * BRANCH_DIFF_FILE_LIST_ROW_HEIGHT);
+                    let file_list_after_spacer_height =
+                        px(file_list_after_rows as f32 * BRANCH_DIFF_FILE_LIST_ROW_HEIGHT);
+                    let diff_viewport_top = -shell.branch_diff_scroll_handle.offset().y;
+                    let diff_viewport_bottom = diff_viewport_top + viewport_height;
                     let selected_path = selected_path
                         .filter(|path| {
                             snapshot
@@ -297,58 +353,90 @@ pub(crate) fn render(
                                                 .size_full()
                                                 .overflow_y_scroll()
                                                 .track_scroll(&shell.branch_diff_file_list_scroll_handle)
-                                                .py(px(6.))
-                                                .children(snapshot.file_diffs.iter().enumerate().map(
-                                                    |(ix, file_diff)| {
-                                                        let path = file_diff.path.clone();
-                                                        let select_path = path.clone();
-                                                        let additions = file_diff.additions;
-                                                        let deletions = file_diff.deletions;
-                                                        let is_selected = selected_path.is_some_and(
-                                                            |selected| selected == path.as_str(),
-                                                        );
-                                                        div()
-                                                            .id(("branch-diff-file", ix))
-                                                            .w_full()
-                                                            .min_w_0()
-                                                            .px(px(10.))
-                                                            .py(px(6.))
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(8.))
-                                                            .when(is_selected, |this| this.bg(mantle))
-                                                            .hover(|this| this.bg(mantle))
-                                                            .cursor_pointer()
-                                                            .on_mouse_down(
-                                                                gpui::MouseButton::Left,
-                                                                cx.listener(move |view, _, _, cx| {
-                                                                    view.branch_diff_selected_path =
-                                                                        Some(select_path.clone());
-                                                                    cx.notify();
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .py(px(BRANCH_DIFF_FILE_LIST_INNER_Y_PADDING))
+                                                        .when(file_list_before_spacer_height > px(0.), |this| {
+                                                            this.child(
+                                                                div()
+                                                                    .w_full()
+                                                                    .h(file_list_before_spacer_height),
+                                                            )
+                                                        })
+                                                        .children(
+                                                            snapshot.file_diffs
+                                                                [file_list_visible_start
+                                                                    ..file_list_visible_end]
+                                                                .iter()
+                                                                .enumerate()
+                                                                .map(|(visible_ix, file_diff)| {
+                                                                    let ix =
+                                                                        file_list_visible_start + visible_ix;
+                                                                    let path = file_diff.path.clone();
+                                                                    let select_path = path.clone();
+                                                                    let additions = file_diff.additions;
+                                                                    let deletions = file_diff.deletions;
+                                                                    let is_selected = selected_path
+                                                                        .is_some_and(|selected| {
+                                                                            selected == path.as_str()
+                                                                        });
+                                                                    div()
+                                                                        .id(("branch-diff-file", ix))
+                                                                        .w_full()
+                                                                        .h(file_list_row_height)
+                                                                        .min_w_0()
+                                                                        .px(px(10.))
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .gap(px(8.))
+                                                                        .when(is_selected, |this| {
+                                                                            this.bg(mantle)
+                                                                        })
+                                                                        .hover(|this| this.bg(mantle))
+                                                                        .cursor_pointer()
+                                                                        .on_mouse_down(
+                                                                            gpui::MouseButton::Left,
+                                                                            cx.listener(
+                                                                                move |view, _, _, cx| {
+                                                                                    view.branch_diff_selected_path =
+                                                                                        Some(select_path.clone());
+                                                                                    cx.notify();
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .flex_1()
+                                                                                .min_w_0()
+                                                                                .overflow_hidden()
+                                                                                .text_ellipsis()
+                                                                                .whitespace_nowrap()
+                                                                                .text_xs()
+                                                                                .text_color(text_color)
+                                                                                .child(path),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .text_color(subtext_color)
+                                                                                .child(format!(
+                                                                                    "+{} -{}",
+                                                                                    additions, deletions
+                                                                                )),
+                                                                        )
                                                                 }),
-                                                            )
-                                                            .child(
+                                                        )
+                                                        .when(file_list_after_spacer_height > px(0.), |this| {
+                                                            this.child(
                                                                 div()
-                                                                    .flex_1()
-                                                                    .min_w_0()
-                                                                    .overflow_hidden()
-                                                                    .text_ellipsis()
-                                                                    .whitespace_nowrap()
-                                                                    .text_xs()
-                                                                    .text_color(text_color)
-                                                                    .child(path),
+                                                                    .w_full()
+                                                                    .h(file_list_after_spacer_height),
                                                             )
-                                                            .child(
-                                                                div()
-                                                                    .text_xs()
-                                                                    .text_color(subtext_color)
-                                                                    .child(format!(
-                                                                        "+{} -{}",
-                                                                        additions, deletions
-                                                                    )),
-                                                            )
-                                                    },
-                                                )),
+                                                        }),
+                                                ),
                                         )
                                         .vertical_scrollbar(&shell.branch_diff_file_list_scroll_handle),
                                 )
@@ -373,19 +461,23 @@ pub(crate) fn render(
                                                         .flex()
                                                         .flex_col()
                                                         .gap(px(12.))
-                                                        .children(super::thread_cards::render_file_diff_cards(
-                                                            std::slice::from_ref(file_diff),
-                                                            text_color,
-                                                            subtext_color,
-                                                            surface0,
-                                                            surface1,
-                                                            mantle,
-                                                            green_color,
-                                                            red_color,
-                                                            font_mono,
-                                                            window,
-                                                            cx,
-                                                        ))
+                                                        .children(
+                                                            super::thread_cards::render_file_diff_cards_for_viewport(
+                                                                std::slice::from_ref(file_diff),
+                                                                text_color,
+                                                                subtext_color,
+                                                                surface0,
+                                                                surface1,
+                                                                mantle,
+                                                                green_color,
+                                                                red_color,
+                                                                font_mono,
+                                                                diff_viewport_top,
+                                                                diff_viewport_bottom,
+                                                                window,
+                                                                cx,
+                                                            ),
+                                                        )
                                                         .into_any_element()
                                                 } else {
                                                     div()

@@ -560,6 +560,8 @@ impl AppShell {
     const PANEL_DIVIDER_WIDTH: Pixels = px(1.);
     const CENTER_PANEL_MIN_WIDTH: Pixels = px(560.);
     const BRANCH_DIFF_PANEL_MIN_WIDTH: Pixels = px(280.);
+    const BRANCH_DIFF_FILE_LIST_ROW_HEIGHT: f32 = 30.;
+    const BRANCH_DIFF_FILE_LIST_INNER_Y_PADDING: f32 = 6.;
     const SKIPPED_FILE_PICKER_DIRS: [&'static str; 11] = [
         ".git",
         ".next",
@@ -595,6 +597,41 @@ impl AppShell {
         if self.branch_diff_panel_width != clamped {
             self.branch_diff_panel_width = clamped;
         }
+    }
+
+    fn scroll_branch_diff_file_list_to_index(&self, index: usize) {
+        let viewport_height = self
+            .branch_diff_file_list_scroll_handle
+            .bounds()
+            .size
+            .height;
+        if viewport_height <= px(0.) {
+            return;
+        }
+
+        let row_height = px(Self::BRANCH_DIFF_FILE_LIST_ROW_HEIGHT);
+        let row_top = px(Self::BRANCH_DIFF_FILE_LIST_INNER_Y_PADDING
+            + index as f32 * Self::BRANCH_DIFF_FILE_LIST_ROW_HEIGHT);
+        let row_bottom = row_top + row_height;
+        let current_offset = self.branch_diff_file_list_scroll_handle.offset();
+        let viewport_top = -current_offset.y;
+        let viewport_bottom = viewport_top + viewport_height;
+        let mut target_viewport_top = viewport_top;
+
+        if row_top < viewport_top {
+            target_viewport_top = row_top;
+        } else if row_bottom > viewport_bottom {
+            target_viewport_top = row_bottom - viewport_height;
+        }
+
+        let max_scroll_top = self
+            .branch_diff_file_list_scroll_handle
+            .max_offset()
+            .height
+            .max(px(0.));
+        target_viewport_top = target_viewport_top.max(px(0.)).min(max_scroll_top);
+        self.branch_diff_file_list_scroll_handle
+            .set_offset(point(current_offset.x, -target_viewport_top));
     }
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -3280,8 +3317,7 @@ impl AppShell {
         }
 
         self.branch_diff_selected_path = Some(next_path);
-        self.branch_diff_file_list_scroll_handle
-            .scroll_to_item(next);
+        self.scroll_branch_diff_file_list_to_index(next);
         true
     }
 
