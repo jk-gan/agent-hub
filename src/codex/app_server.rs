@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -158,6 +158,8 @@ pub enum AppServerError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Rpc(RpcError),
+    CodexCliMissing,
+    CodexCliUnsupported,
     Disconnected,
 }
 
@@ -167,6 +169,8 @@ impl fmt::Display for AppServerError {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Json(e) => write!(f, "JSON error: {e}"),
             Self::Rpc(e) => write!(f, "{e}"),
+            Self::CodexCliMissing => write!(f, "{}", codex_install_guidance()),
+            Self::CodexCliUnsupported => write!(f, "{}", codex_upgrade_guidance()),
             Self::Disconnected => write!(f, "app-server disconnected"),
         }
     }
@@ -186,6 +190,8 @@ impl From<serde_json::Error> for AppServerError {
 
 type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>;
 
+const CODEX_CLI_URL: &str = "https://github.com/openai/codex";
+
 pub struct AppServer {
     outgoing_tx: Sender<String>,
     next_id: AtomicU64,
@@ -203,12 +209,14 @@ impl AppServer {
 
     fn spawn() -> Result<Self, AppServerError> {
         let codex_path = find_codex_executable();
+        verify_codex_prerequisites(&codex_path)?;
         let mut child = Command::new(codex_path)
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn()?;
+            .spawn()
+            .map_err(map_codex_spawn_error)?;
 
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
@@ -399,9 +407,61 @@ fn find_codex_executable() -> PathBuf {
     PathBuf::from("codex")
 }
 
+fn verify_codex_prerequisites(codex_path: &Path) -> Result<(), AppServerError> {
+    let codex_version_status = Command::new(codex_path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(map_codex_spawn_error)?;
+
+    if !codex_version_status.success() {
+        return Err(AppServerError::CodexCliUnsupported);
+    }
+
+    let app_server_help_status = Command::new(codex_path)
+        .arg("app-server")
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(map_codex_spawn_error)?;
+
+    if !app_server_help_status.success() {
+        return Err(AppServerError::CodexCliUnsupported);
+    }
+
+    Ok(())
+}
+
+fn map_codex_spawn_error(error: std::io::Error) -> AppServerError {
+    if error.kind() == ErrorKind::NotFound {
+        return AppServerError::CodexCliMissing;
+    }
+    AppServerError::Io(error)
+}
+
+fn codex_install_guidance() -> String {
+    format!(
+        "Codex CLI is required to run Agent Hub, but it was not found.\n\
+Install Codex CLI, then relaunch Agent Hub.\n\
+Install: {CODEX_CLI_URL}"
+    )
+}
+
+fn codex_upgrade_guidance() -> String {
+    format!(
+        "Your Codex CLI installation does not support the `app-server` interface required by Agent Hub.\n\
+Please upgrade or reinstall Codex CLI, then relaunch Agent Hub.\n\
+Install: {CODEX_CLI_URL}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::IncomingMessage;
+    use super::{IncomingMessage, codex_install_guidance, codex_upgrade_guidance};
 
     #[test]
     fn parses_server_request_as_notification_with_request_id() {
@@ -451,5 +511,18 @@ mod tests {
             }
             other => panic!("expected notification, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn codex_install_guidance_includes_codex_cli_link() {
+        let guidance = codex_install_guidance();
+        assert!(guidance.contains("https://github.com/openai/codex"));
+    }
+
+    #[test]
+    fn codex_upgrade_guidance_mentions_app_server_support() {
+        let guidance = codex_upgrade_guidance();
+        assert!(guidance.contains("app-server"));
+        assert!(guidance.contains("upgrade or reinstall"));
     }
 }
