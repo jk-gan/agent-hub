@@ -40,6 +40,7 @@ pub(crate) fn render(
         .relative()
         .child(
             div()
+                .id("chat-scroll-shell")
                 .relative()
                 .size_full()
                 .min_h_0()

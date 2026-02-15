@@ -341,6 +341,7 @@ pub(crate) fn render(
                                 .flex()
                                 .child(
                                     div()
+                                        .id("branch-diff-file-list-scroll-shell")
                                         .relative()
                                         .w(px(180.))
                                         .min_w(px(140.))
@@ -443,16 +444,27 @@ pub(crate) fn render(
                                 .child(div().w(px(1.)).h_full().bg(surface1))
                                 .child(
                                     div()
+                                        .id("branch-diff-scroll-shell")
                                         .relative()
                                         .flex_1()
                                         .min_w_0()
                                         .min_h_0()
+                                        .on_scroll_wheel(cx.listener(
+                                            |_, _: &gpui::ScrollWheelEvent, _, cx| {
+                                                cx.stop_propagation();
+                                            },
+                                        ))
                                         .child(
                                             div()
                                                 .id("branch-diff-scroll")
                                                 .size_full()
                                                 .overflow_y_scroll()
                                                 .track_scroll(&shell.branch_diff_scroll_handle)
+                                                .on_scroll_wheel(cx.listener(
+                                                    |_, _: &gpui::ScrollWheelEvent, _, cx| {
+                                                        cx.stop_propagation();
+                                                    },
+                                                ))
                                                 .px(px(10.))
                                                 .py(px(10.))
                                                 .child(if let Some(file_diff) = selected_file {
