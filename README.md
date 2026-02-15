@@ -9,6 +9,7 @@
 <p align="center">Codex App Clone in Rust</p>
 
 Agent Hub is a native desktop client for Codex App Server, built with Rust and GPUI.
+Because it uses Codex App Server, it runs on the same harness used by Codex App and Codex CLI.
 It is intentionally scoped and does not yet include every feature from the official Codex app.
 
 This app is currently 100% vibe-coded with gpt-5.3-codex. I built it quickly to get a usable
@@ -30,8 +31,8 @@ The app already supports the main Codex workflow end to end:
 ## How It Works
 
 Agent Hub starts `codex app-server` as a child process and communicates over line-delimited
-JSON-RPC on stdio. The UI is implemented in GPUI, and most app state and orchestration currently
-lives in `src/main.rs`.
+JSON-RPC on stdio, using the same Codex harness surface as Codex App and Codex CLI. The UI is
+implemented in GPUI, and most app state and orchestration currently lives in `src/main.rs`.
 
 If you want protocol details, the docs in `docs/events/` are a good reference for observed
 request/response/notification payloads.
