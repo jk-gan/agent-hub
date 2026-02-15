@@ -1195,24 +1195,28 @@ impl AppShell {
     }
 
     fn make_untracked_file_diff(path: &str, content: &str) -> diff_view::ParsedFileDiff {
-        let content_lines = content.lines().collect::<Vec<_>>();
-        let mut rows = Vec::with_capacity(content_lines.len().saturating_add(1));
+        let mut rows = Vec::new();
         rows.push(diff_view::DiffRow::HunkHeader(diff_view::HunkHeaderRow {
-            raw: format!("@@ -0,0 +1,{} @@", content_lines.len()),
+            raw: String::new(),
         }));
 
-        rows.extend(content_lines.iter().enumerate().map(|(ix, line)| {
-            diff_view::DiffRow::Line(diff_view::DiffLineRow {
+        let mut additions = 0usize;
+        for line in content.lines() {
+            additions = additions.saturating_add(1);
+            rows.push(diff_view::DiffRow::Line(diff_view::DiffLineRow {
                 kind: diff_view::DiffLineKind::Added,
                 old_lineno: None,
-                new_lineno: Some((ix as u32).saturating_add(1)),
-                text: (*line).to_string(),
-            })
-        }));
+                new_lineno: Some(u32::try_from(additions).unwrap_or(u32::MAX)),
+                text: line.to_string(),
+            }));
+        }
+        if let Some(diff_view::DiffRow::HunkHeader(header)) = rows.first_mut() {
+            header.raw = format!("@@ -0,0 +1,{additions} @@");
+        }
 
         diff_view::ParsedFileDiff {
             path: path.to_string(),
-            additions: content_lines.len(),
+            additions,
             deletions: 0,
             rows,
         }
@@ -1226,10 +1230,6 @@ impl AppShell {
 
         if !metadata.is_file() {
             return Self::make_placeholder_added_file_diff(path, "[not a regular file]");
-        }
-
-        if metadata.len() > 500_000 {
-            return Self::make_placeholder_added_file_diff(path, "[file too large to render]");
         }
 
         let Ok(bytes) = fs::read(&full_path) else {
@@ -5878,7 +5878,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppShell, RenderableMessage, ThreadRow, ThreadSpeaker, file_token_before_cursor};
+    use super::{
+        AppShell, RenderableMessage, ThreadRow, ThreadSpeaker, diff_view, file_token_before_cursor,
+    };
     use serde_json::json;
     use std::collections::HashSet;
     use std::fs;
@@ -6230,6 +6232,40 @@ mod tests {
         assert!(snapshot.file_diffs.is_empty());
         assert_eq!(snapshot.total_additions, 0);
         assert_eq!(snapshot.total_deletions, 0);
+
+        fs::remove_dir_all(workspace).expect("should clean up temp workspace");
+    }
+
+    #[test]
+    fn load_untracked_file_diff_renders_large_utf8_files() {
+        let unique = format!(
+            "agent-hub-large-untracked-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        );
+        let workspace = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&workspace).expect("should create temp workspace");
+        let large_content = "a".repeat(600_000);
+        fs::write(workspace.join("large.txt"), &large_content).expect("should write large file");
+
+        let parsed = AppShell::load_untracked_file_diff(&workspace, "large.txt");
+
+        assert_eq!(parsed.path, "large.txt");
+        assert_eq!(parsed.additions, 1);
+        assert_eq!(parsed.deletions, 0);
+        assert!(parsed.rows.iter().all(|row| !matches!(
+            row,
+            diff_view::DiffRow::Line(line) if line.text == "[file too large to render]"
+        )));
+        match parsed.rows.get(1) {
+            Some(diff_view::DiffRow::Line(line)) => {
+                assert_eq!(line.text.len(), large_content.len())
+            }
+            other => panic!("expected first diff row to be a line, got {other:?}"),
+        }
 
         fs::remove_dir_all(workspace).expect("should clean up temp workspace");
     }
