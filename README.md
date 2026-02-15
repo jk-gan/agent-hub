@@ -1,19 +1,19 @@
 <p align="center">
-  <img alt="Agent Hub" src=".github/media/app-screenshot.png" width="650">
-  <h1 align="center">
-	  Agent Hub
-  </h1>
+  <img alt="Agent Hub" src=".github/media/app-screenshot.png" width="750">
+	<p align="center">
+	  <img alt="Agent Hub Logo" src=".github/media/app-icon.png" width="80">
+	</p>
+	<h1 align="center">Agent Hub</h1>
 </p>
 
 <p align="center">Codex App Clone in Rust</p>
 
 Agent Hub is a native desktop client for Codex App Server, built with Rust and GPUI.
-Right now, the product direction is intentionally simple: it is a Codex-like client focused on
-fast local desktop performance.
+It is intentionally scoped and does not yet include every feature from the official Codex app.
 
-This app is currently 100% vibe-coded with gpt-5.3-codex. I needed a quick, usable alternative
-because the official Codex app felt laggy and drained battery. I may refactor the code and add
-features over time as I keep using it.
+This app is currently 100% vibe-coded with gpt-5.3-codex. I built it quickly to get a usable
+desktop client for my own workflow, and right now it covers everything I personally need.
+If you need additional features, contributions are very welcome.
 
 ## Current Status
 
